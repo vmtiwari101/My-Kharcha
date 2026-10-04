@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication and user isolation
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // Default deny for all unspecified top-level paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User-scoped data isolation under users/{uid} hierarchy
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      // Recursive match for all subcollections:
+      // profile, accounts, cards, transactions, categories, subcategories, merchants, settings
+      match /{allSubcollections=**} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+  }
+}
