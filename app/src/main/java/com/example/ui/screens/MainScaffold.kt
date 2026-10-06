@@ -42,11 +42,31 @@ fun MainScaffold(viewModel: KharchaViewModel) {
     var addTxInitialType by remember { mutableStateOf("EXPENSE") }
     var showAddTxModal by remember { mutableStateOf(false) }
     var selectedTxDetail by remember { mutableStateOf<TransactionEntity?>(null) }
+    var selectedTxToEdit by remember { mutableStateOf<TransactionEntity?>(null) }
 
     var showCreateCatDialog by remember { mutableStateOf(false) }
     var showCreateSubcatDialog by remember { mutableStateOf(false) }
 
-    androidx.activity.compose.BackHandler(enabled = currentTab != "home") {
+    androidx.activity.compose.BackHandler(enabled = selectedTxToEdit != null) {
+        selectedTxToEdit = null
+    }
+    androidx.activity.compose.BackHandler(enabled = selectedTxDetail != null && selectedTxToEdit == null) {
+        selectedTxDetail = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showAddTxModal) {
+        showAddTxModal = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showAddMenu) {
+        showAddMenu = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showCreateSubcatDialog) {
+        showCreateSubcatDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showCreateCatDialog) {
+        showCreateCatDialog = false
+    }
+
+    androidx.activity.compose.BackHandler(enabled = currentTab != "home" && selectedTxDetail == null && selectedTxToEdit == null && !showAddTxModal && !showAddMenu && !showCreateCatDialog && !showCreateSubcatDialog) {
         when (currentTab) {
             "subcategory_drill" -> viewModel.currentTab.value = "category_drill"
             "category_drill", "merchant_drill", "account_drill", "source_drill" -> viewModel.currentTab.value = viewModel.lastMainTab.value
@@ -152,7 +172,7 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                         addTxInitialType = "INCOME"
                         showAddTxModal = true
                     },
-                    onSelectTransaction = { tx -> selectedTxDetail = tx }
+                    onSelectTransaction = { tx -> selectedTxToEdit = tx }
                 )
                 "transactions" -> TransactionsScreen(
                     viewModel = viewModel,
@@ -160,7 +180,7 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                         addTxInitialType = "EXPENSE"
                         showAddTxModal = true
                     },
-                    onSelectTransaction = { tx -> selectedTxDetail = tx }
+                    onSelectTransaction = { tx -> selectedTxToEdit = tx }
                 )
                 "categories" -> CategoriesScreen(
                     viewModel = viewModel,
@@ -216,7 +236,8 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                     }
 
                     val categoryTxs = filteredTxs.filter { tx ->
-                        tx.categoryId == catId || allSplits.any { it.transactionId == tx.id && it.categoryId == catId }
+                        (tx.categoryId == catId || allSplits.any { it.transactionId == tx.id && it.categoryId == catId }) &&
+                        (if (cat?.isIncome == true) tx.type == "INCOME" else tx.type == "EXPENSE" && tx.isExpense && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER")
                     }.sortedWith(compareByDescending<com.example.data.entity.TransactionEntity> { it.date }.thenByDescending { it.time })
 
                     val totalCatSpend = categoryTxs.sumOf { tx ->
@@ -263,9 +284,11 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                     val sub = subcategories.find { it.id == subId }
                     val subName = sub?.let { getBilingualName(it.name, it.nameHindi) } ?: "Subcategory"
 
+                    val cat = categories.find { it.id == catId }
                     val subcatTxs = filteredTxs.filter { tx ->
-                        (tx.categoryId == catId && tx.subcategoryId == subId) || 
-                        allSplits.any { it.transactionId == tx.id && it.categoryId == catId && it.subcategoryId == subId }
+                        ((tx.categoryId == catId && tx.subcategoryId == subId) || 
+                        allSplits.any { it.transactionId == tx.id && it.categoryId == catId && it.subcategoryId == subId }) &&
+                        (if (cat?.isIncome == true) tx.type == "INCOME" else tx.type == "EXPENSE" && tx.isExpense && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER")
                     }.sortedWith(compareByDescending<com.example.data.entity.TransactionEntity> { it.date }.thenByDescending { it.time })
 
                     val totalSubSpend = subcatTxs.sumOf { tx ->
@@ -308,8 +331,8 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                         title = "$merchantName History",
                         drillDownType = "merchant",
                         transactions = merchantTxs,
-                        totalIncome = 0.0,
-                        totalExpense = merchantTxs.sumOf { it.amount },
+                        totalIncome = merchantTxs.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
+                        totalExpense = merchantTxs.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
                         netSavings = 0.0,
                         savingsRate = 0.0,
                         categories = categories,
@@ -335,15 +358,15 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                     val filteredTxs = com.example.utils.DateFilterUtils.filterByRange(transactions, selectedRange, customStart, customEnd)
                     val acc = accounts.find { it.id == accId }
                     val accName = acc?.name ?: "Account"
-                    val accountTxs = filteredTxs.filter { it.accountId == accId && !it.isInternalTransfer }
+                    val accountTxs = filteredTxs.filter { it.accountId == accId && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }
                         .sortedWith(compareByDescending<com.example.data.entity.TransactionEntity> { it.date }.thenByDescending { it.time })
 
                     ReportsDrillDownView(
                         title = "$accName History",
                         drillDownType = "account",
                         transactions = accountTxs,
-                        totalIncome = accountTxs.filter { it.type == "INCOME" }.sumOf { it.amount },
-                        totalExpense = accountTxs.filter { it.type == "EXPENSE" && it.isExpense }.sumOf { it.amount },
+                        totalIncome = accountTxs.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
+                        totalExpense = accountTxs.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
                         netSavings = 0.0,
                         savingsRate = 0.0,
                         categories = categories,
@@ -381,8 +404,8 @@ fun MainScaffold(viewModel: KharchaViewModel) {
                         title = srcLabel,
                         drillDownType = "source",
                         transactions = sourceTxs,
-                        totalIncome = sourceTxs.filter { it.type == "INCOME" }.sumOf { it.amount },
-                        totalExpense = sourceTxs.filter { it.type == "EXPENSE" && it.isExpense }.sumOf { it.amount },
+                        totalIncome = sourceTxs.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
+                        totalExpense = sourceTxs.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount },
                         netSavings = 0.0,
                         savingsRate = 0.0,
                         categories = categories,
@@ -555,7 +578,19 @@ fun MainScaffold(viewModel: KharchaViewModel) {
         TransactionDetailDialog(
             tx = selectedTxDetail!!,
             viewModel = viewModel,
-            onDismiss = { selectedTxDetail = null }
+            onDismiss = { selectedTxDetail = null },
+            onEdit = { tx ->
+                selectedTxDetail = null
+                selectedTxToEdit = tx
+            }
+        )
+    }
+
+    if (selectedTxToEdit != null) {
+        EditTransactionDialog(
+            tx = selectedTxToEdit!!,
+            viewModel = viewModel,
+            onDismiss = { selectedTxToEdit = null }
         )
     }
 

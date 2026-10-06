@@ -107,16 +107,16 @@ object AuthManager {
     private const val KEY_LAST_LOGIN_AT = "user_last_login_at"
     private const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
 
-    // Default Web Client ID for Google Sign-In derived from google-services.json
-    var webClientId: String = "884104898509-ica2ci4k6fij86qm58l9mds6mb9po81f.apps.googleusercontent.com"
-
+    // Default Web Client ID removed, must come from strings.xml
+    
     fun getWebClientId(context: Context): String {
         return try {
             val resId = com.example.R.string.default_web_client_id
             val id = context.getString(resId)
-            if (id.isNotEmpty()) id else webClientId
-        } catch (e: Throwable) {
-            webClientId
+            if (id.isNotEmpty()) id else throw Exception("Google Client ID is empty in strings.xml")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get default_web_client_id: ${e.message}")
+            throw Exception("Google Client ID not configured in strings.xml")
         }
     }
 
@@ -229,10 +229,10 @@ object AuthManager {
                 context = activity
             )
         } catch (e: GetCredentialCancellationException) {
-            Log.w(TAG, "Google Sign-In cancelled by user")
+            Log.w(TAG, "Google Sign-In cancelled by user", e)
             return@withContext Result.failure(Exception("Sign-in cancelled. Please select your Google account to continue."))
         } catch (e: GetCredentialException) {
-            Log.w(TAG, "Primary credential request failed: ${e.message}, trying fallback")
+            Log.w(TAG, "Primary credential request failed: ${e.message}", e)
             try {
                 val fallbackRequest = GetCredentialRequest.Builder()
                     .addCredentialOption(signInWithGoogleOption)
@@ -242,23 +242,23 @@ object AuthManager {
                     context = activity
                 )
             } catch (fallbackEx: GetCredentialCancellationException) {
-                Log.w(TAG, "Google Sign-In fallback cancelled by user")
+                Log.w(TAG, "Google Sign-In fallback cancelled by user", fallbackEx)
                 return@withContext Result.failure(Exception("Sign-in cancelled. Please select your Google account to continue."))
             } catch (fallbackEx: GetCredentialException) {
-                Log.e(TAG, "Google Sign-In credential exception: ${fallbackEx.message}", fallbackEx)
+                Log.e(TAG, "Google Sign-In credential exception: ${fallbackEx.message}, Type: ${fallbackEx::class.java.simpleName}", fallbackEx)
                 val isNoCredential = fallbackEx.message?.contains("28433") == true ||
                         fallbackEx.message?.contains("matching credential", ignoreCase = true) == true ||
                         fallbackEx.message?.contains("NoCredentialException", ignoreCase = true) == true
                 val errorMsg = if (isNoCredential) {
                     "No Google account selected or available. Please ensure a Google account is logged in on this device and try again."
                 } else {
-                    fallbackEx.localizedMessage ?: "Google Sign-In failed. Please try again."
+                    "Google Sign-In failed: ${fallbackEx.message}"
                 }
                 return@withContext Result.failure(Exception(errorMsg))
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error in credential retrieval: ${e.message}", e)
-            return@withContext Result.failure(Exception(e.localizedMessage ?: "Authentication failed"))
+            Log.e(TAG, "Unexpected error in credential retrieval: ${e.message}, Type: ${e::class.java.simpleName}", e)
+            return@withContext Result.failure(Exception("Authentication failed: ${e.message}"))
         }
 
         try {

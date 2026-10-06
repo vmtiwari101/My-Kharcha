@@ -2,6 +2,7 @@ package com.example.data
 
 import android.util.Log
 import com.example.data.dao.KharchaDao
+import com.example.data.entity.AccountEntity
 import com.example.data.entity.CategoryEntity
 import com.example.data.entity.SubcategoryEntity
 
@@ -455,8 +456,42 @@ object DefaultCategoryData {
                     }
                 }
             }
+            // 3. Ensure a canonical active generic Cash account exists
+            ensureDefaultCashAccount(dao)
         } catch (e: Exception) {
             Log.e(TAG, "Error restoring categories and subcategories: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Ensures that the standard generic Cash account exists in Room DB.
+     */
+    suspend fun ensureDefaultCashAccount(dao: KharchaDao) {
+        try {
+            val existingAccounts = dao.getAllAccountsSync()
+            val hasCash = existingAccounts.any {
+                it.isActive && (it.type.equals("Cash", ignoreCase = true) || it.name.equals("Cash", ignoreCase = true) || it.id == "acc-cash")
+            }
+            if (!hasCash) {
+                val defaultCash = AccountEntity(
+                    id = "acc-cash",
+                    name = "Cash",
+                    type = "Cash",
+                    bankName = "Cash",
+                    last4Digits = "",
+                    icon = "payments",
+                    colour = "#D97706",
+                    isActive = true,
+                    isDefault = false,
+                    isOwnedByMe = true,
+                    createdAt = DEFAULT_DATE,
+                    updatedAt = DEFAULT_DATE
+                )
+                dao.insertAccount(defaultCash)
+                Log.d(TAG, "Ensured default generic Cash account")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error ensuring default cash account: ${e.message}", e)
         }
     }
 }

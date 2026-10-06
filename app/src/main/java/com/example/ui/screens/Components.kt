@@ -254,11 +254,12 @@ fun GroupedAccountSelectorDialog(
     val itemsList = remember(accounts, cards) {
         val rawList = mutableListOf<SelectionItem>()
         for (acc in activeAccounts) {
-            val finalType = when (acc.type) {
-                "Credit Card" -> "Credit Card"
-                "Bank Account" -> "Bank Account"
-                "Debit Card" -> "Debit Card"
-                "UPI" -> "UPI"
+            val finalType = when {
+                acc.type.equals("Credit Card", ignoreCase = true) -> "Credit Card"
+                acc.type.equals("Bank Account", ignoreCase = true) -> "Bank Account"
+                acc.type.equals("Debit Card", ignoreCase = true) -> "Debit Card"
+                acc.type.equals("UPI", ignoreCase = true) -> "UPI"
+                acc.type.equals("Cash", ignoreCase = true) || acc.name.equals("Cash", ignoreCase = true) -> "Cash"
                 else -> "Other"
             }
             rawList.add(
@@ -269,6 +270,22 @@ fun GroupedAccountSelectorDialog(
                     last4Digits = acc.last4Digits,
                     type = finalType,
                     originalAccount = acc
+                )
+            )
+        }
+
+        // Always guarantee a Cash account entry is available in the selection list
+        val hasCashInRaw = rawList.any { it.type == "Cash" || it.id == "acc-cash" || it.name.equals("Cash", ignoreCase = true) }
+        if (!hasCashInRaw) {
+            val existingDbCash = accounts.find { it.type.equals("Cash", ignoreCase = true) || it.name.equals("Cash", ignoreCase = true) || it.id == "acc-cash" }
+            rawList.add(
+                SelectionItem(
+                    id = existingDbCash?.id ?: "acc-cash",
+                    name = existingDbCash?.name ?: "Cash",
+                    bankName = "Cash",
+                    last4Digits = "",
+                    type = "Cash",
+                    originalAccount = existingDbCash
                 )
             )
         }
@@ -327,6 +344,7 @@ fun GroupedAccountSelectorDialog(
     }
 
     // Group filtered items
+    val cashAccounts = filteredItems.filter { it.type == "Cash" }
     val bankAccounts = filteredItems.filter { it.type == "Bank Account" }
     val creditCards = filteredItems.filter { it.type == "Credit Card" }
     val debitCards = filteredItems.filter { it.type == "Debit Card" }
@@ -388,6 +406,18 @@ fun GroupedAccountSelectorDialog(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    if (cashAccounts.isNotEmpty()) {
+                        item {
+                            SelectorSectionHeader("CASH")
+                        }
+                        items(cashAccounts) { item ->
+                            SelectorRowItem(item) {
+                                onSelected(item.id, item.type)
+                                onDismiss()
+                            }
+                        }
+                    }
+
                     if (bankAccounts.isNotEmpty()) {
                         item {
                             SelectorSectionHeader("BANK ACCOUNTS")
@@ -436,7 +466,7 @@ fun GroupedAccountSelectorDialog(
                         }
                     }
 
-                    if (bankAccounts.isEmpty() && creditCards.isEmpty() && debitCards.isEmpty() && upiOther.isEmpty()) {
+                    if (cashAccounts.isEmpty() && bankAccounts.isEmpty() && creditCards.isEmpty() && debitCards.isEmpty() && upiOther.isEmpty()) {
                         item {
                             Box(
                                 modifier = Modifier

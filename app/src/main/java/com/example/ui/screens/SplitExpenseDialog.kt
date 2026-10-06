@@ -102,6 +102,16 @@ fun SplitExpenseDialog(
 
     var activeCatModalTargetDraftIndex by remember { mutableStateOf<Int?>(null) }
     var activeSubcatModalTargetDraftIndex by remember { mutableStateOf<Int?>(null) }
+
+    androidx.activity.compose.BackHandler(enabled = activeSubcatModalTargetDraftIndex != null) {
+        activeSubcatModalTargetDraftIndex = null
+    }
+    androidx.activity.compose.BackHandler(enabled = activeCatModalTargetDraftIndex != null) {
+        activeCatModalTargetDraftIndex = null
+    }
+    androidx.activity.compose.BackHandler(enabled = activeSubcatModalTargetDraftIndex == null && activeCatModalTargetDraftIndex == null) {
+        onDismiss()
+    }
     var newCatName by remember { mutableStateOf("") }
     var newCatNameHindi by remember { mutableStateOf("") }
     var newSubcatName by remember { mutableStateOf("") }

@@ -124,6 +124,13 @@ fun ReportsScreen(
     var activeDrillDown by remember { mutableStateOf<String?>(null) } // "income", "expense", "net"
     var selectedTransactionForDetail by remember { mutableStateOf<TransactionEntity?>(null) }
 
+    BackHandler(enabled = selectedTransactionForDetail != null) {
+        selectedTransactionForDetail = null
+    }
+    BackHandler(enabled = activeDrillDown != null && selectedTransactionForDetail == null) {
+        activeDrillDown = null
+    }
+
     if (selectedTransactionForDetail != null) {
         TransactionDetailDialog(
             tx = selectedTransactionForDetail!!,

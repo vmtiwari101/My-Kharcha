@@ -80,6 +80,14 @@ fun HomeScreen(
     var showEditBudgetDialog by remember { mutableStateOf(false) }
     var monthExpanded by remember { mutableStateOf(false) }
 
+    androidx.activity.compose.BackHandler(enabled = showEditBudgetDialog) {
+        showEditBudgetDialog = false
+    }
+
+    val homeListState = androidx.compose.runtime.saveable.rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) {
+        androidx.compose.foundation.lazy.LazyListState()
+    }
+
     val context = androidx.compose.ui.platform.LocalContext.current
     val historicalScanState by viewModel.historicalScanState.collectAsState()
 
@@ -132,6 +140,7 @@ fun HomeScreen(
     }
 
     LazyColumn(
+        state = homeListState,
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFFF8FAFC))

@@ -16,6 +16,9 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
 enum class IngestionStatus {
     IMPORTED,
     ENRICHED,
@@ -28,6 +31,231 @@ enum class IngestionStatus {
 object TransactionIngestionEngine {
 
     private const val TAG = "TransactionIngestion"
+    private val ingestionMutex = Mutex()
+
+    data class ExtractedBalanceInfo(
+        val accountBalance: Double? = null,
+        val availableLimit: Double? = null,
+        val outstandingAmount: Double? = null
+    )
+
+    fun parseIsoOrMillisToLong(str: String): Long {
+        if (str.isBlank()) return 0L
+        val longVal = str.toLongOrNull()
+        if (longVal != null && longVal > 0L) return longVal
+        return try {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.parse(str)?.time ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    fun formatLongToIso(millis: Long): String {
+        return SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date(millis))
+    }
+
+    /**
+     * Extracts balance figures (account balance, available limit, outstanding amount) from financial message text.
+     */
+    fun extractBalanceInfo(text: String): ExtractedBalanceInfo? {
+        if (text.isBlank()) return null
+
+        var accountBalance: Double? = null
+        var availableLimit: Double? = null
+        var outstandingAmount: Double? = null
+
+        val filler = """(?:\s+(?:in|for|of|on|at|your|to|a/c)\s+[a-zA-Z0-9/#\*-]+(?:\s+(?:a/c|ac|account|card|ending|in|with|no\.?|your)\b)*)*"""
+            // 1. Account Balance extraction patterns
+        val balancePatterns = listOf(
+            Regex("""(?i)\b(?:available\s+bal(?:ance)?|avbl?\s*bal(?:ance)?|avl\s*bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:current\s+bal(?:ance)?|curr\s*bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:new\s+bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:closing\s+bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:ledger\s+bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:account\s+bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:clear\s+bal(?:ance)?)$filler\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\bbal(?:ance)?\.?(?:\s+(?:is|:|:-|=))?\s*(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:available|total|account|avl|avbl|curr|current|new|closing|ledger)\s+bal(?:ance)?\.?\s*[:=-]?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)""")
+        )
+
+        for (p in balancePatterns) {
+            val m = p.find(text)
+            if (m != null) {
+                val numStr = m.groupValues[1].replace(",", "")
+                val parsed = numStr.toDoubleOrNull()
+                if (parsed != null && parsed >= 0.0) {
+                    accountBalance = parsed
+                    break
+                }
+            }
+        }
+
+        // 2. Available Credit / Limit extraction patterns
+        val limitPatterns = listOf(
+            Regex("""(?i)\b(?:available\s+credit\s*limit|available\s*limit|avbl?\s*limit|avl\s*limit|available\s*credit)\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)"""),
+            Regex("""(?i)\b(?:credit\s*limit)\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)""")
+        )
+
+        for (p in limitPatterns) {
+            val m = p.find(text)
+            if (m != null) {
+                val numStr = m.groupValues[1].replace(",", "")
+                val parsed = numStr.toDoubleOrNull()
+                if (parsed != null && parsed >= 0.0) {
+                    availableLimit = parsed
+                    break
+                }
+            }
+        }
+
+        // 3. Outstanding Amount extraction patterns
+        val outstandingPatterns = listOf(
+            Regex("""(?i)\b(?:current\s+outstanding|total\s*outstanding|outstanding\s*bal(?:ance)?|outstanding)\s*(?:is|:|:-|=)?\s*(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)""")
+        )
+
+        for (p in outstandingPatterns) {
+            val m = p.find(text)
+            if (m != null) {
+                val numStr = m.groupValues[1].replace(",", "")
+                val parsed = numStr.toDoubleOrNull()
+                if (parsed != null && parsed >= 0.0) {
+                    outstandingAmount = parsed
+                    break
+                }
+            }
+        }
+
+        if (accountBalance == null && availableLimit == null && outstandingAmount == null) {
+            return null
+        }
+
+        return ExtractedBalanceInfo(
+            accountBalance = accountBalance,
+            availableLimit = availableLimit,
+            outstandingAmount = outstandingAmount
+        )
+    }
+
+    /**
+     * Safely applies extracted balance updates to the resolved AccountEntity/CardEntity.
+     */
+    suspend fun applyExtractedBalance(
+        dao: KharchaDao,
+        accountId: String?,
+        cardId: String?,
+        balanceInfo: ExtractedBalanceInfo,
+        messageTimestamp: Long
+    ) = withContext(Dispatchers.IO) {
+        if (accountId.isNullOrEmpty()) return@withContext
+
+        val accounts = dao.getAllAccountsSync()
+        val targetAcc = accounts.find { it.id == accountId } ?: return@withContext
+
+        // CASH SAFETY: Bank/card SMS balance must NEVER update generic Cash account
+        if (targetAcc.type.equals("Cash", ignoreCase = true) || targetAcc.name.equals("Cash", ignoreCase = true) || targetAcc.id == "acc-cash") {
+            Log.d(TAG, "Balance update skipped: target account is Cash")
+            return@withContext
+        }
+
+        // NEWER BALANCE MUST PROTECT AGAINST OLDER BALANCE
+        val existingTime = parseIsoOrMillisToLong(targetAcc.updatedAt)
+        if (messageTimestamp > 0 && existingTime > 0 && (existingTime - messageTimestamp > 86400000L)) {
+            Log.d(TAG, "Balance update skipped: message timestamp ($messageTimestamp) is older than existing account balance timestamp ($existingTime)")
+            return@withContext
+        }
+
+        val nowIso = if (messageTimestamp > 0) formatLongToIso(messageTimestamp) else getNowIsoString()
+
+        val isCreditCardAcc = targetAcc.type.equals("Credit Card", ignoreCase = true) || cardId != null
+        if (isCreditCardAcc) {
+            var updatedOutstanding = targetAcc.outstandingAmount
+            var updatedCreditLimit = targetAcc.creditLimit
+
+            if (balanceInfo.outstandingAmount != null) {
+                updatedOutstanding = balanceInfo.outstandingAmount
+            } else if (balanceInfo.accountBalance != null) {
+                updatedOutstanding = balanceInfo.accountBalance
+            }
+
+            if (balanceInfo.availableLimit != null) {
+                if (updatedCreditLimit > 0.0) {
+                    updatedOutstanding = maxOf(0.0, updatedCreditLimit - balanceInfo.availableLimit)
+                } else {
+                    updatedCreditLimit = balanceInfo.availableLimit
+                }
+            }
+
+            // Calculate anchored initialBalance (representing Initial Debt) for Credit Cards.
+            // This ensures consistency between the stored balance and the calculated balance shown in the UI.
+            val allTransactions = dao.getAllTransactionsSync()
+            val accTxs = allTransactions.filter { tx ->
+                TransactionIdentityResolver.isCreditCardPurchase(tx, cardId, targetAcc.id, targetAcc.last4Digits) ||
+                TransactionIdentityResolver.isCreditCardPaymentOrRefund(tx, cardId, targetAcc.id, targetAcc.last4Digits)
+            }
+            val expenseTotal = accTxs.filter { TransactionIdentityResolver.isCreditCardPurchase(it, cardId, targetAcc.id, targetAcc.last4Digits) }.sumOf { it.amount }
+            val paymentTotal = accTxs.filter { TransactionIdentityResolver.isCreditCardPaymentOrRefund(it, cardId, targetAcc.id, targetAcc.last4Digits) }.sumOf { it.amount }
+            val netTxSum = expenseTotal - paymentTotal
+            val newInitialBalance = updatedOutstanding - netTxSum
+
+            val updatedAcc = targetAcc.copy(
+                outstandingAmount = updatedOutstanding,
+                creditLimit = updatedCreditLimit,
+                initialBalance = newInitialBalance,
+                updatedAt = nowIso
+            )
+            dao.insertAccount(updatedAcc)
+
+            if (!cardId.isNullOrEmpty()) {
+                val card = dao.getAllCardsSync().find { it.id == cardId }
+                if (card != null) {
+                    val updatedCard = card.copy(
+                        outstandingAmount = updatedOutstanding,
+                        creditLimit = updatedCreditLimit,
+                        updatedAt = nowIso
+                    )
+                    dao.insertCard(updatedCard)
+                }
+            }
+            Log.d(TAG, "Updated Credit Card balance for ${targetAcc.name}: outstanding=$updatedOutstanding, limit=$updatedCreditLimit")
+        } else {
+            // Bank Account / Debit / UPI
+            val targetBalance = balanceInfo.accountBalance
+            if (targetBalance != null) {
+                val allTransactions = dao.getAllTransactionsSync()
+                val cards = dao.getAllCardsSync()
+                // Replicate filtering logic from AccountsScreen.kt to ensure consistency between balance anchor and UI display.
+                // This includes both resolved transactions and those that match by last4 digits for this account.
+                var netTxSum = 0.0
+                allTransactions.forEach { tx ->
+                    val isInternal = tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER"
+                    if (isInternal) {
+                        if (tx.accountId == accountId) netTxSum -= tx.amount
+                        else if (tx.counterpartyAccountId == accountId) netTxSum += tx.amount
+                    } else {
+                        val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
+                        val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
+                        if (tx.accountId == accountId) {
+                            if (isCredit) netTxSum += tx.amount
+                            else if (isDebit) netTxSum -= tx.amount
+                        } else if (tx.counterpartyAccountId == accountId) {
+                            netTxSum += tx.amount
+                        }
+                    }
+                }
+                val newInitialBalance = targetBalance - netTxSum
+                val updatedAcc = targetAcc.copy(
+                    initialBalance = newInitialBalance,
+                    updatedAt = nowIso
+                )
+                dao.insertAccount(updatedAcc)
+                Log.d(TAG, "Updated Bank Account balance for ${targetAcc.name}: targetBalance=$targetBalance, newInitialBalance=$newInitialBalance")
+            }
+        }
+    }
 
     private fun getNowIsoString(): String {
         return SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
@@ -141,7 +369,11 @@ object TransactionIngestionEngine {
         val c2 = m2.trim().lowercase(Locale.US)
 
         if (c1.isEmpty() || c2.isEmpty()) return true
-        val genericList = listOf("unknown merchant", "other", "general", "transaction", "payment", "bank transfer", "notification from app")
+        val genericList = listOf(
+            "unknown merchant", "other", "general", "transaction", "payment", 
+            "bank transfer", "notification from app", "credit card bill payment", 
+            "internal transfer", "card payment"
+        )
         if (genericList.contains(c1) || genericList.contains(c2)) return true
         if (c1 == c2) return true
 
@@ -159,36 +391,48 @@ object TransactionIngestionEngine {
      * Evaluates a confidence score (0 to 100) for whether [candidate] is a duplicate of [existing].
      */
     fun evaluateMatchConfidence(candidate: TransactionEntity, existing: TransactionEntity): MatchConfidence {
-        // 1. Direction check
-        val candIsDebit = candidate.direction?.equals("DEBIT", ignoreCase = true) == true ||
-                (candidate.direction?.equals("CREDIT", ignoreCase = true) != true && candidate.type.equals("EXPENSE", ignoreCase = true))
-        val existIsDebit = existing.direction?.equals("DEBIT", ignoreCase = true) == true ||
-                (existing.direction?.equals("CREDIT", ignoreCase = true) != true && existing.type.equals("EXPENSE", ignoreCase = true))
-        if (candIsDebit != existIsDebit) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Direction mismatch")
-        }
-
-        // 2. Direct originalReference check for identical source messages
+        // 1. Direct originalReference check for identical source messages
         if (candidate.originalReference.isNotEmpty() && existing.originalReference.isNotEmpty() &&
             candidate.originalReference == existing.originalReference) {
             return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Identical original reference string")
         }
 
-        // 3. Normalized Reference ID check
+        val candIsDebit = candidate.direction?.equals("DEBIT", ignoreCase = true) == true ||
+                (candidate.direction?.equals("CREDIT", ignoreCase = true) != true && candidate.type.equals("EXPENSE", ignoreCase = true))
+        val existIsDebit = existing.direction?.equals("DEBIT", ignoreCase = true) == true ||
+                (existing.direction?.equals("CREDIT", ignoreCase = true) != true && existing.type.equals("EXPENSE", ignoreCase = true))
+
+        // Opposite directions on different accounts: transfer counterparts (paired transactions), NOT duplicates
+        if (candIsDebit != existIsDebit && candidate.accountId.isNotEmpty() && existing.accountId.isNotEmpty() && candidate.accountId != existing.accountId) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Opposite directions on different accounts: transfer counterpart, not duplicate")
+        }
+
+        // 2. Normalized Reference ID check (highest priority: RRN, UTR, UPI Ref)
         val candRefs = getTransactionReferenceKeys(candidate)
         val existRefs = getTransactionReferenceKeys(existing)
         if (candRefs.isNotEmpty() && existRefs.isNotEmpty()) {
             val commonRefs = candRefs.intersect(existRefs)
             if (commonRefs.isNotEmpty()) {
-                return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Matched reference ID: $commonRefs")
+                if (Math.abs(candidate.amount - existing.amount) < 0.01) {
+                    return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Matched reference ID: $commonRefs with matching amount")
+                }
             } else {
                 return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Conflicting reference IDs: $candRefs vs $existRefs")
             }
         }
 
-        // 4. Amount check
+        // 3. Amount check
         if (Math.abs(candidate.amount - existing.amount) >= 0.01) {
             return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Amount mismatch: ${candidate.amount} vs ${existing.amount}")
+        }
+
+        // 4. Direction check (Exempt transfers/credit card bill payments from hard direction mismatch)
+        val isCandTransferOrCc = candidate.isInternalTransfer || candidate.type == "INTERNAL_TRANSFER" || 
+            candidate.transactionType == "CREDIT_CARD_BILL_PAYMENT" || candidate.transactionType == "CARD_PAYMENT"
+        val isExistTransferOrCc = existing.isInternalTransfer || existing.type == "INTERNAL_TRANSFER" || 
+            existing.transactionType == "CREDIT_CARD_BILL_PAYMENT" || existing.transactionType == "CARD_PAYMENT"
+        if (candIsDebit != existIsDebit && !isCandTransferOrCc && !isExistTransferOrCc) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Direction mismatch")
         }
 
         // 5. Date check (without matching reference ID, different dates cannot be merged)
@@ -213,10 +457,10 @@ object TransactionIngestionEngine {
             }
         }
 
-        // 6. Last 4 Digits conflict check
+        // 6. Last 4 Digits conflict check (exempt transfers and credit card bill payments)
         val candLast4 = candidate.last4Digits.trim().replace("[^0-9]".toRegex(), "")
         val existLast4 = existing.last4Digits.trim().replace("[^0-9]".toRegex(), "")
-        if (candLast4.length == 4 && existLast4.length == 4 && candLast4 != existLast4) {
+        if (candLast4.length == 4 && existLast4.length == 4 && candLast4 != existLast4 && !isCandTransferOrCc && !isExistTransferOrCc) {
             return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Last4 mismatch: $candLast4 vs $existLast4")
         }
 
@@ -229,6 +473,9 @@ object TransactionIngestionEngine {
 
         // 8. Positive Score Calculation
         var score = 40 // Base score for same direction + same amount + same date
+        if (isCandTransferOrCc || isExistTransferOrCc) {
+            score += 20
+        }
 
         // Merchant evidence
         val isExactMerchant = candMerchant.equals(existMerchant, ignoreCase = true) && candMerchant.isNotBlank() && !candMerchant.equals("Unknown Merchant", true)
@@ -364,16 +611,78 @@ object TransactionIngestionEngine {
         val incomingPriority = calculateIdentityPriority(incoming, accounts, cards)
         val useIncomingIdentity = incomingPriority > existingPriority
 
-        val mergedAccountId = if (useIncomingIdentity && incoming.accountId.isNotEmpty()) {
+        // Intelligently merge Type and Direction: Priority for INTERNAL_TRANSFER and CREDIT_CARD_BILL_PAYMENT
+        val isIncomingInternal = incoming.isInternalTransfer || incoming.type == "INTERNAL_TRANSFER" || incoming.transactionType == "INTERNAL_TRANSFER"
+        val isExistingInternal = existing.isInternalTransfer || existing.type == "INTERNAL_TRANSFER" || existing.transactionType == "INTERNAL_TRANSFER"
+        val isIncomingCcBill = incoming.transactionType == "CREDIT_CARD_BILL_PAYMENT" || incoming.transactionType == "CARD_PAYMENT"
+        val isExistingCcBill = existing.transactionType == "CREDIT_CARD_BILL_PAYMENT" || existing.transactionType == "CARD_PAYMENT"
+
+        val mergedType = when {
+            isIncomingCcBill || isExistingCcBill -> "INTERNAL_TRANSFER"
+            isIncomingInternal && !isExistingInternal -> incoming.type
+            isExistingInternal -> existing.type
+            else -> if (useIncomingIdentity) incoming.type else existing.type
+        }
+
+        val mergedTransactionType = when {
+            isIncomingCcBill || isExistingCcBill -> "CARD_PAYMENT"
+            isIncomingInternal && !isExistingInternal -> incoming.transactionType
+            isExistingInternal -> existing.transactionType
+            else -> if (useIncomingIdentity) incoming.transactionType else existing.transactionType
+        }
+
+        val mergedIsInternal = isIncomingInternal || isExistingInternal || isIncomingCcBill || isExistingCcBill
+        val mergedDirection = if (mergedIsInternal) {
+            if (incoming.direction == "DEBIT" || existing.direction == "DEBIT") "DEBIT"
+            else incoming.direction ?: existing.direction
+        } else {
+            if (useIncomingIdentity) incoming.direction ?: existing.direction else existing.direction ?: incoming.direction
+        }
+
+        var mergedAccountId = if (useIncomingIdentity && incoming.accountId.isNotEmpty()) {
             incoming.accountId
         } else {
             existing.accountId.ifEmpty { incoming.accountId }
         }
 
-        val mergedCardId = if (useIncomingIdentity) {
+        var mergedCardId = if (useIncomingIdentity) {
             incoming.cardId ?: existing.cardId
         } else {
             existing.cardId ?: incoming.cardId
+        }
+
+        var mergedCounterpartyId = existing.counterpartyAccountId ?: incoming.counterpartyAccountId
+        var mergedTransferGroupId = existing.transferGroupId ?: incoming.transferGroupId
+
+        // For internal transfers and credit card bill payments, resolve source bank account vs destination credit card
+        if (mergedIsInternal || mergedTransactionType == "CREDIT_CARD_BILL_PAYMENT") {
+            val accA = accounts.find { it.id == existing.accountId }
+            val accB = accounts.find { it.id == incoming.accountId }
+            val isAccACreditCard = accA?.type?.contains("Card", ignoreCase = true) == true
+            val isAccBCreditCard = accB?.type?.contains("Card", ignoreCase = true) == true
+
+            if (isAccACreditCard && accB != null && !isAccBCreditCard) {
+                mergedAccountId = accB.id
+                mergedCounterpartyId = accA.id
+                mergedCardId = cards.find { it.accountId == accA.id }?.id ?: existing.cardId ?: incoming.cardId
+            } else if (isAccBCreditCard && accA != null && !isAccACreditCard) {
+                mergedAccountId = accA.id
+                mergedCounterpartyId = accB.id
+                mergedCardId = cards.find { it.accountId == accB.id }?.id ?: incoming.cardId ?: existing.cardId
+            }
+            if (mergedTransferGroupId == null) {
+                mergedTransferGroupId = "tg-internal-" + UUID.randomUUID().toString().substring(0, 8)
+            }
+        }
+
+        val finalMergedMerchant = if (mergedIsInternal || mergedTransactionType == "CARD_PAYMENT" || mergedTransactionType == "CREDIT_CARD_BILL_PAYMENT") {
+            if (mergedTransactionType == "CARD_PAYMENT" || mergedTransactionType == "CREDIT_CARD_BILL_PAYMENT" || isIncomingCcBill || isExistingCcBill) {
+                "Credit Card Bill Payment"
+            } else {
+                "Internal Transfer"
+            }
+        } else {
+            mergedMerchant
         }
 
         val mergedLast4 = if (useIncomingIdentity && incoming.last4Digits.isNotEmpty()) {
@@ -393,7 +702,9 @@ object TransactionIngestionEngine {
             else existingPayment.ifEmpty { incomingPayment }
         }
 
-        val mergedNeedsReview = if (useIncomingIdentity) {
+        val mergedNeedsReview = if (mergedIsInternal && mergedCounterpartyId != null) {
+            false
+        } else if (useIncomingIdentity) {
             incoming.needsReview
         } else {
             existing.needsReview && incoming.needsReview
@@ -426,11 +737,18 @@ object TransactionIngestionEngine {
         }
 
         return existing.copy(
-            merchant = mergedMerchant,
-            categoryId = mergedCategoryId,
+            type = mergedType,
+            transactionType = mergedTransactionType,
+            direction = mergedDirection,
+            isInternalTransfer = mergedIsInternal,
+            isExpense = if (mergedIsInternal) false else (mergedType == "EXPENSE"),
+            merchant = finalMergedMerchant,
+            categoryId = if (mergedIsInternal) "cat-transfer" else mergedCategoryId,
             subcategoryId = mergedSubcategoryId,
             accountId = mergedAccountId,
             cardId = mergedCardId,
+            counterpartyAccountId = mergedCounterpartyId,
+            transferGroupId = mergedTransferGroupId,
             last4Digits = mergedLast4,
             last4 = mergedLast4,
             paymentMethod = mergedPaymentMethod,
@@ -450,8 +768,9 @@ object TransactionIngestionEngine {
         context: Context,
         rawTx: TransactionEntity,
         rawText: String
-    ): Pair<TransactionEntity?, IngestionStatus> = withContext(Dispatchers.IO) {
-        try {
+    ): Pair<TransactionEntity?, IngestionStatus> = ingestionMutex.withLock {
+        withContext(Dispatchers.IO) {
+            try {
             // Guard against promotional / marketing / advertisement messages
             if (SmsParser.isPromotionalOrAdvertisementMessage(rawText) || (rawTx.note.isNotBlank() && SmsParser.isPromotionalOrAdvertisementMessage(rawTx.note))) {
                 Log.d(TAG, "Ingestion Skipped: Message detected as promotional/advertisement (${rawTx.amount})")
@@ -616,9 +935,15 @@ object TransactionIngestionEngine {
                 }
             }
 
+            val resolvedRawTx = rawTx.copy(
+                accountId = mappedAccountId,
+                cardId = mappedCardId,
+                last4Digits = mappedLast4 ?: rawTx.last4Digits,
+                last4 = mappedLast4 ?: rawTx.last4Digits
+            )
             // 3. Centralized Robust Deduplication Check (Rules 1-8)
             val duplicateTx = existingTxs.find { existing ->
-                isDuplicateTransaction(rawTx, existing)
+                isDuplicateTransaction(resolvedRawTx, existing)
             }
 
             // Check if there is an auto-generated internal transfer counterpart waiting for confirmation
@@ -673,6 +998,28 @@ object TransactionIngestionEngine {
                     Log.d(TAG, "Auto-created CardEntity persisted on duplicate merge: ${pendingNewCard.id} (${pendingNewCard.name})")
                 }
 
+                // Check if incoming text is a credit card bill payment or transfer
+                val isIncomingCardBill = textLower.contains("credit card payment") ||
+                    textLower.contains("cc payment") ||
+                    textLower.contains("card bill") ||
+                    textLower.contains("cred club") ||
+                    textLower.contains("cred.club") ||
+                    textLower.contains("cred club credited") ||
+                    (Regex("\\bcred\\b", RegexOption.IGNORE_CASE).containsMatchIn(textLower) && (textLower.contains("credited") || textLower.contains("payment") || textLower.contains("club") || textLower.contains("paid") || textLower.contains("bill"))) ||
+                    (textLower.contains("bill payment") && (textLower.contains("credit card") || textLower.contains("card"))) ||
+                    Regex("(?:bill\\s+)?payment\\s+.*?\\s+(?:towards|for|to|of)\\s+.*?card", RegexOption.IGNORE_CASE).containsMatchIn(textLower) ||
+                    Regex("paid\\s+.*?\\s+(?:towards|for|to)?\\s*.*?credit\\s*card", RegexOption.IGNORE_CASE).containsMatchIn(textLower) ||
+                    Regex("payment\\s+received\\s+.*?\\s+(?:towards|for|to)\\s+.*?card", RegexOption.IGNORE_CASE).containsMatchIn(textLower) ||
+                    (textLower.contains("thank you") && textLower.contains("payment") && (textLower.contains("credit card") || textLower.contains("card"))) ||
+                    (textLower.contains("credit card") && (textLower.contains("payment received") || textLower.contains("bill paid") || textLower.contains("payment of") || textLower.contains("autopay"))) ||
+                    Regex("(?:paid|transferred)\\s+(?:rs\\.?|inr|₹)?\\s*[\\d,.]*\\s*(?:to|towards)\\s+.*?card", RegexOption.IGNORE_CASE).containsMatchIn(textLower)
+
+                val incomingTxType = if (isIncomingCardBill || rawTx.transactionType == "CARD_PAYMENT" || rawTx.transactionType == "CREDIT_CARD_BILL_PAYMENT") {
+                    "CARD_PAYMENT"
+                } else if (rawTx.isInternalTransfer || rawTx.type == "INTERNAL_TRANSFER") {
+                    "INTERNAL_TRANSFER"
+                } else if (rawTx.type == "EXPENSE") "EXPENSE" else "INCOME"
+
                 // Prepare a metadata-enriched version of the incoming transaction for merging
                 val enrichedIncoming = rawTx.copy(
                     accountId = mappedAccountId,
@@ -680,7 +1027,10 @@ object TransactionIngestionEngine {
                     last4Digits = mappedLast4 ?: rawTx.last4Digits,
                     last4 = mappedLast4 ?: rawTx.last4Digits,
                     needsReview = needsReview,
-                    transactionType = if (rawTx.type == "EXPENSE") "EXPENSE" else "INCOME"
+                    type = if (isIncomingCardBill) "INTERNAL_TRANSFER" else rawTx.type,
+                    transactionType = incomingTxType,
+                    isInternalTransfer = isIncomingCardBill || rawTx.isInternalTransfer,
+                    isExpense = if (isIncomingCardBill) false else rawTx.isExpense
                 )
                 
                 // Intelligently merge metadata without creating duplicate records (Rule 5, 6)
@@ -688,6 +1038,20 @@ object TransactionIngestionEngine {
                 val rowId = dao.insertTransaction(mergedTx)
                 if (rowId != -1L) {
                     Log.d(TAG, "Duplicate prevented and metadata merged for transaction: ${mergedTx.id} (Ref: ${mergedTx.transactionReference})")
+
+                    // Extract and apply balance updates safely if account identity is known
+                    if (mappedAccountId.isNotEmpty()) {
+                        val balInfo = extractBalanceInfo(rawText)
+                        if (balInfo != null) {
+                            val msgTime = if (rawTx.updatedAt.isNotEmpty()) {
+                                parseIsoOrMillisToLong(rawTx.updatedAt)
+                            } else {
+                                System.currentTimeMillis()
+                            }
+                            applyExtractedBalance(dao, mappedAccountId, mappedCardId, balInfo, msgTime)
+                        }
+                    }
+
                     return@withContext Pair(mergedTx, IngestionStatus.DUPLICATE)
                 } else {
                     Log.e(TAG, "Failed to merge metadata for duplicate transaction: ${mergedTx.id}")
@@ -723,6 +1087,10 @@ object TransactionIngestionEngine {
             val isCardBillPayment = textLower.contains("credit card payment") ||
                 textLower.contains("cc payment") ||
                 textLower.contains("card bill") ||
+                textLower.contains("cred club") ||
+                textLower.contains("cred.club") ||
+                textLower.contains("cred club credited") ||
+                (Regex("\\bcred\\b", RegexOption.IGNORE_CASE).containsMatchIn(textLower) && (textLower.contains("credited") || textLower.contains("payment") || textLower.contains("club") || textLower.contains("paid") || textLower.contains("bill"))) ||
                 (textLower.contains("bill payment") && (textLower.contains("credit card") || textLower.contains("card"))) ||
                 Regex("(?:bill\\s+)?payment\\s+.*?\\s+(?:towards|for|to|of)\\s+.*?card", RegexOption.IGNORE_CASE).containsMatchIn(textLower) ||
                 Regex("paid\\s+.*?\\s+(?:towards|for|to)?\\s*.*?credit\\s*card", RegexOption.IGNORE_CASE).containsMatchIn(textLower) ||
@@ -730,6 +1098,10 @@ object TransactionIngestionEngine {
                 (textLower.contains("thank you") && textLower.contains("payment") && (textLower.contains("credit card") || textLower.contains("card"))) ||
                 (textLower.contains("credit card") && (textLower.contains("payment received") || textLower.contains("bill paid") || textLower.contains("payment of") || textLower.contains("autopay"))) ||
                 Regex("(?:paid|transferred)\\s+(?:rs\\.?|inr|₹)?\\s*[\\d,.]*\\s*(?:to|towards)\\s+.*?card", RegexOption.IGNORE_CASE).containsMatchIn(textLower)
+
+            // SPECIAL DIRECTION FIX: If it's a bill payment and contains 'debited', it's always a DEBIT from the source account
+            val finalDirection = if (isCardBillPayment && textLower.contains("debited")) "DEBIT" else direction
+            val finalRawType = if (isCardBillPayment && textLower.contains("debited")) "EXPENSE" else rawTx.type
 
             val isGeneralTransfer = textLower.contains("self transfer") ||
                 textLower.contains("transfer to self") ||
@@ -762,7 +1134,7 @@ object TransactionIngestionEngine {
 
                     val targetCreditAccId = matchedCreditAcc?.id ?: matchedCreditCard?.accountId
                     isInternal = true
-                    finalTxType = "CREDIT_CARD_BILL_PAYMENT"
+                    finalTxType = "CARD_PAYMENT"
 
                     if (targetCreditAccId != null) {
                         if (mappedAccountId == targetCreditAccId) {
@@ -781,7 +1153,7 @@ object TransactionIngestionEngine {
                             needsReview = true
                         }
                     } else {
-                        // Reliable target credit card could not be identified: keep transaction safe as CREDIT_CARD_BILL_PAYMENT, do not guess
+                        // Reliable target credit card could not be identified: keep transaction safe as CARD_PAYMENT, do not guess
                         counterpartyId = null
                         needsReview = true
                     }
@@ -792,13 +1164,13 @@ object TransactionIngestionEngine {
                         isInternal = true
                         transferGroupId = "tg-internal-" + UUID.randomUUID().toString().substring(0, 8)
                         counterpartyId = targetAccount.id
-                        finalTxType = if (targetAccount.type.lowercase().contains("card")) "CREDIT_CARD_BILL_PAYMENT" else "INTERNAL_TRANSFER"
+                        finalTxType = if (targetAccount.type.lowercase().contains("card")) "CARD_PAYMENT" else "INTERNAL_TRANSFER"
                         needsReview = false
                     } else if (targetCard != null) {
                         isInternal = true
                         transferGroupId = "tg-internal-" + UUID.randomUUID().toString().substring(0, 8)
                         counterpartyId = targetCard.accountId
-                        finalTxType = "CREDIT_CARD_BILL_PAYMENT"
+                        finalTxType = "CARD_PAYMENT"
                         needsReview = false
                     } else if (isGeneralTransfer) {
                         isInternal = true
@@ -833,11 +1205,11 @@ object TransactionIngestionEngine {
                 }
             }
 
-            val resolvedMerchantName = if ((finalTxType == "CREDIT_CARD_BILL_PAYMENT" || finalTxType == "CARD_PAYMENT") && (rawTx.merchant.isBlank() || rawTx.merchant.equals("Unknown Merchant", true))) {
+            val resolvedMerchantName = if (finalTxType == "CREDIT_CARD_BILL_PAYMENT" || finalTxType == "CARD_PAYMENT") {
                 "Credit Card Bill Payment"
             } else if (isInternal && (rawTx.merchant.isBlank() || rawTx.merchant.equals("Unknown Merchant", true) || rawTx.merchant.equals("Other", true))) {
                 "Internal Transfer"
-            } else rawTx.merchant
+            } else com.example.utils.SmsParser.sanitizeMerchantName(rawTx.merchant)
 
             val savedPref = if (isInternal || !isDebit) null else com.example.utils.MerchantLearningEngine.getMapping(context, resolvedMerchantName)
             
@@ -876,9 +1248,9 @@ object TransactionIngestionEngine {
                 last4Digits = mappedLast4 ?: rawTx.last4Digits,
                 last4 = mappedLast4 ?: rawTx.last4Digits,
                 transactionId = rawTx.transactionId ?: rawTx.id,
-                type = if (isInternal) "INTERNAL_TRANSFER" else (if (isDebit) "EXPENSE" else "INCOME"),
+                type = if (isInternal) "INTERNAL_TRANSFER" else (if (finalDirection == "DEBIT") "EXPENSE" else "INCOME"),
                 transactionType = finalTxType,
-                direction = direction,
+                direction = finalDirection,
                 duplicateFingerprint = fingerprint,
                 isInternalTransfer = isInternal,
                 transferGroupId = transferGroupId,
@@ -887,7 +1259,7 @@ object TransactionIngestionEngine {
                 subcategoryId = subcategoryIdToUse,
                 merchant = resolvedMerchantName,
                 needsReview = finalNeedsReview,
-                isExpense = if (isInternal) false else isDebit,
+                isExpense = if (isInternal) false else (finalDirection == "DEBIT"),
                 updatedAt = getNowIsoString()
             )
 
@@ -962,6 +1334,20 @@ object TransactionIngestionEngine {
                     dao.insertCard(pendingNewCard)
                     Log.d(TAG, "Auto-created CardEntity inserted: ${pendingNewCard.id} (${pendingNewCard.name})")
                 }
+
+                // Extract and apply balance updates safely if account identity is known
+                if (mappedAccountId.isNotEmpty()) {
+                    val balInfo = extractBalanceInfo(rawText)
+                    if (balInfo != null) {
+                        val msgTime = if (rawTx.updatedAt.isNotEmpty()) {
+                            parseIsoOrMillisToLong(rawTx.updatedAt)
+                        } else {
+                            parseIsoOrMillisToLong(finalTx.updatedAt)
+                        }
+                        val validTime = if (msgTime > 0) msgTime else System.currentTimeMillis()
+                        applyExtractedBalance(dao, mappedAccountId, mappedCardId, balInfo, validTime)
+                    }
+                }
             } else {
                 Log.e(TAG, "Room insert FAILED: ID=${finalTx.id}")
                 return@withContext Pair(null, IngestionStatus.FAILED)
@@ -976,7 +1362,7 @@ object TransactionIngestionEngine {
             return@withContext Pair(null, IngestionStatus.FAILED)
         }
     }
-
+ }
     /**
      * One-time cleanup / migration to remove duplicate transactions in the database,
      * merging useful metadata into a single preserved record per transaction (Rule 9, 10, 11).

@@ -53,6 +53,16 @@ fun MoreScreen(viewModel: KharchaViewModel) {
     var snackbarMessage by remember { mutableStateOf<String?>(null) }
     var showInitialSmsScanDialog by remember { mutableStateOf(false) }
     var showScanRangeDialog by remember { mutableStateOf(false) }
+
+    androidx.activity.compose.BackHandler(enabled = showConnectGmailDialog) {
+        showConnectGmailDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showScanRangeDialog) {
+        showScanRangeDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showInitialSmsScanDialog) {
+        showInitialSmsScanDialog = false
+    }
     var scanRangeMonths by remember { mutableStateOf(viewModel.getHistoricalScanRangeMonths()) }
     val historicalScanState by viewModel.historicalScanState.collectAsState()
 

@@ -71,7 +71,10 @@ fun CategoryDrillDownView(
             .take(5)
     }
 
+    val drillDownListState = androidx.compose.runtime.saveable.rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+
     LazyColumn(
+        state = drillDownListState,
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFFF8FAFC))

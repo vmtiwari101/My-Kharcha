@@ -722,6 +722,8 @@ object SmsParser {
         val finalMerchant = if (isCcBillPayment) "Credit Card Bill Payment" else merchant
         val finalCategoryId = if (isCcBillPayment) "cat-cc-bill" else categoryId
 
+        val msgTimestampIso = TransactionIngestionEngine.formatLongToIso(timestamp)
+
         val tx = TransactionEntity(
             id = txId,
             type = finalType,
@@ -740,7 +742,7 @@ object SmsParser {
             originalReference = originalRef,
             last4Digits = last4,
             createdAt = nowIso,
-            updatedAt = nowIso
+            updatedAt = msgTimestampIso
         )
 
         return SmsParseStatus.Success(tx)
@@ -755,9 +757,10 @@ object SmsParser {
     }
 
     private fun extractAmount(body: String): Double {
-        // Remove balance, limit, and available figures to avoid false matching balance amounts (Rule 1)
+        // Remove balance, limit, and available figures to avoid false matching balance amounts
+        val balanceKeywords = "available\\s*balance|avbl?\\s*bal|avl\\s*bal|current\\s*balance|curr\\s*bal|new\\s*balance|new\\s*bal|closing\\s*balance|ledger\\s*balance|account\\s*balance|credit\\s*limit|available\\s*limit|avbl?\\s*limit|outstanding\\s*amount|outstanding\\s*bal(?:ance)?|statement\\s*balance|balance|bal|limit|outstanding"
         val cleanBody = body
-            .replace(Regex("(?:available\\s*balance|avbl\\s*bal|new\\s*balance|ledger\\s*balance|account\\s*balance|credit\\s*limit|available\\s*limit|avbl\\s*limit|outstanding\\s*amount|statement\\s*balance|balance|bal|limit|outstanding)\\s*(?:is|of|to|for|:)?\\s*(?:rs\\.?|inr|₹)?\\s*[\\d,.]+", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("(?:$balanceKeywords)\\s*(?:is|of|to|for|:)?\\s*(?:rs\\.?|inr|₹)?\\s*[\\d,.]+", RegexOption.IGNORE_CASE), "")
             .replace(Regex("avbl\\s*bal[\\s\\S]*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("available\\s*balance[\\s\\S]*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("bal(?:ance)?:?\\s*(?:rs|inr|₹)?[\\s\\S]*", RegexOption.IGNORE_CASE), "")
@@ -814,8 +817,33 @@ object SmsParser {
         return ""
     }
 
+    fun sanitizeMerchantName(merchant: String): String {
+        val trimmed = merchant.trim()
+        if (trimmed.isEmpty()) return "Unknown Merchant"
+        val lower = trimmed.lowercase(Locale.ENGLISH)
+        val hexRegex = Regex("^[0-9a-f]{8,24}$")
+        val emailIdRegex = Regex("^email\\s+[0-9a-fA-Z]{8,24}$", RegexOption.IGNORE_CASE)
+        val emailTxRegex = Regex("^(?:email-tx|tx-email|msg|email-ref)-\\S*$", RegexOption.IGNORE_CASE)
+
+        if (lower.startsWith("email ") && (hexRegex.matches(lower.substring(6).trim()) || lower.substring(6).trim().length in 8..24)) {
+            return "Unknown Merchant"
+        }
+        if (hexRegex.matches(lower) && lower.length >= 8) {
+            return "Unknown Merchant"
+        }
+        if (emailIdRegex.matches(trimmed) || emailTxRegex.matches(trimmed)) {
+            return "Unknown Merchant"
+        }
+        if (lower == "other" || lower == "unknown" || lower == "unknown merchant") {
+            return "Unknown Merchant"
+        }
+        return trimmed
+    }
+
     fun cleanMerchantName(rawMerchant: String, fullText: String = ""): String {
-        var m = rawMerchant.trim()
+        val mSanitized = sanitizeMerchantName(rawMerchant)
+        if (mSanitized == "Unknown Merchant") return "Unknown Merchant"
+        var m = mSanitized
         
         // Remove common reference prefixes that aren't part of the merchant name
         val refPrefixes = listOf("UPI/", "VPA/", "RRN:", "UTR:", "REF:", "TXN:", "TRANSFER TO", "PAID TO", "SENT TO")

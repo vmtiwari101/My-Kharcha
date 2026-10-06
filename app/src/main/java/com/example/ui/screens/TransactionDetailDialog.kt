@@ -27,7 +27,8 @@ import java.util.Locale
 fun TransactionDetailDialog(
     tx: TransactionEntity,
     viewModel: KharchaViewModel,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onEdit: (TransactionEntity) -> Unit = {}
 ) {
     val categories by viewModel.categories.collectAsState()
     val subcategories by viewModel.subcategories.collectAsState()
@@ -61,9 +62,18 @@ fun TransactionDetailDialog(
     } else null
     val counterpartyDisplay = counterpartyAccount?.name ?: counterpartyCard?.let { "${it.name} (•••• ${it.last4Digits})" }
 
-    var showEditDialog by remember { mutableStateOf(false) }
     var showSplitDialog by remember { mutableStateOf(false) }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+
+    androidx.activity.compose.BackHandler(enabled = showDeleteConfirmDialog) {
+        showDeleteConfirmDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showSplitDialog) {
+        showSplitDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = !showDeleteConfirmDialog && !showSplitDialog) {
+        onDismiss()
+    }
 
     val formatINR: (Double) -> String = { amt ->
         "₹" + NumberFormat.getNumberInstance(Locale("en", "IN")).format(amt)
@@ -191,7 +201,7 @@ fun TransactionDetailDialog(
                                     color = if (isCardPayment) Color(0xFF7C3AED) else Color(0xFF1D4ED8)
                                 )
                                 val thisAccName = acc?.name ?: "Account"
-                                val otherName = counterpartyDisplay ?: if (isCardPayment) "Credit Card" else "Unresolved Account"
+                                val otherName = counterpartyDisplay ?: if (isCardPayment) "Credit Card" else "Unresolved / Needs Review"
                                 val flow = if (isOutgoing) "$thisAccName → $otherName" else "$otherName → $thisAccName"
                                 Text(
                                     text = flow,
@@ -273,7 +283,7 @@ fun TransactionDetailDialog(
                                         if (bankDisplayName.isNotEmpty() && bankDisplayName != "Cash" && bankDisplayName != "Manual") {
                                             BankLogo(bankName = bankDisplayName, size = 18.dp, shapeRadius = 4.dp)
                                         }
-                                        Text(text = acc?.name ?: "Manual", fontSize = 11.sp, color = Color(0xFF0F172A), fontWeight = FontWeight.Bold)
+                                        Text(text = acc?.name ?: if (tx.paymentMethod.equals("Cash", ignoreCase = true)) "Cash" else tx.paymentMethod.ifEmpty { "Manual" }, fontSize = 11.sp, color = Color(0xFF0F172A), fontWeight = FontWeight.Bold)
                                     }
                                 }
                             } else {
@@ -285,7 +295,7 @@ fun TransactionDetailDialog(
                                     "EMAIL" -> "Email"
                                     else -> "Manual"
                                 })
-                                DetailRow("Account", acc?.name ?: "Manual")
+                                DetailRow("Account", acc?.name ?: if (tx.paymentMethod.equals("Cash", ignoreCase = true)) "Cash" else tx.paymentMethod.ifEmpty { "Manual" })
                             }
 
                             DetailRow("Date & Time", "${formatDateNice(tx.date)} at ${tx.time}")
@@ -362,7 +372,7 @@ fun TransactionDetailDialog(
                         }
 
                         OutlinedButton(
-                            onClick = { showEditDialog = true },
+                            onClick = { onEdit(tx) },
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.weight(1f)
                         ) {
@@ -411,14 +421,6 @@ fun TransactionDetailDialog(
                     Text("Cancel")
                 }
             }
-        )
-    }
-
-    if (showEditDialog) {
-        EditTransactionDialog(
-            tx = tx,
-            viewModel = viewModel,
-            onDismiss = { showEditDialog = false }
         )
     }
 

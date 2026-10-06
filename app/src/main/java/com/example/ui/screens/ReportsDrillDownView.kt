@@ -190,7 +190,10 @@ fun ReportsDrillDownView(
                 Text(text = "No transactions found for this selection.", fontSize = 12.sp, color = Color(0xFF64748B))
             }
         } else {
+            val drillDownListState = androidx.compose.runtime.saveable.rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+
             LazyColumn(
+                state = drillDownListState,
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 contentPadding = PaddingValues(bottom = 32.dp)
             ) {

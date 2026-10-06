@@ -175,6 +175,54 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
             repository.cleanupDuplicateTransactions()
             TransactionIngestionEngine.normalizeExistingTransactions(dao)
             com.example.utils.CreditCardReminderManager.rescheduleAllAsync(application)
+            repairIdentityMappingIfNeeded(dao)
+        }
+    }
+
+    private suspend fun repairIdentityMappingIfNeeded(dao: com.example.data.dao.KharchaDao) {
+        try {
+            val accounts = dao.getAllAccountsSync()
+            val transactions = dao.getAllTransactionsSync()
+            
+            val acc2345 = accounts.find { it.last4Digits == "2345" && (it.bankName.contains("Axis", true) || it.name.contains("Axis", true)) }
+            if (acc2345 != null) {
+                val linkedTx = transactions.filter { it.accountId == acc2345.id }
+                val isIdfcEvidence = linkedTx.any { tx -> 
+                    val text = "${tx.note} ${tx.merchant} ${tx.originalReference}".lowercase()
+                    text.contains("idfc") || tx.source.contains("idfc", true)
+                } || linkedTx.isEmpty()
+
+                if (isIdfcEvidence) {
+                    val repairedAcc = acc2345.copy(
+                        name = "IDFC FIRST Bank Account •••• 2345",
+                        bankName = "IDFC FIRST Bank",
+                        type = "Bank Account",
+                        updatedAt = java.time.Instant.now().toString()
+                    )
+                    dao.insertAccount(repairedAcc)
+                    android.util.Log.d("KharchaRepair", "Safely repaired account 2345 from Axis Bank to IDFC FIRST Bank")
+                }
+            }
+
+            val card1843 = accounts.find { it.last4Digits == "1843" }
+            if (card1843 == null) {
+                val newAxisCardAcc = AccountEntity(
+                    id = "acc-auto-axis-1843",
+                    name = "Axis Bank Credit Card •••• 1843",
+                    type = "Credit Card",
+                    bankName = "Axis Bank",
+                    last4Digits = "1843",
+                    icon = "credit-card",
+                    colour = "#7C3AED",
+                    isActive = true,
+                    isOwnedByMe = true,
+                    createdAt = java.time.Instant.now().toString(),
+                    updatedAt = java.time.Instant.now().toString()
+                )
+                dao.insertAccount(newAxisCardAcc)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("KharchaRepair", "Error repairing identity mapping", e)
         }
     }
 
@@ -715,6 +763,22 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
             val existing = transactions.value.find { it.id == id }
                 ?: repository.allTransactions.first().find { it.id == id }
             val now = getNowIsoString()
+            val isTransfer = type == "INTERNAL_TRANSFER"
+            
+            val finalIsExpense = if (isTransfer || type == "INCOME") false else isExpense
+            val finalIsInternalTransfer = isTransfer
+            val finalTransactionType = if (isTransfer) {
+                if (existing?.transactionType != null && existing.transactionType != "INTERNAL_TRANSFER") existing.transactionType else "INTERNAL_TRANSFER"
+            } else null
+            val finalDirection = if (isTransfer) {
+                existing?.direction ?: "DEBIT"
+            } else {
+                if (type == "INCOME") "CREDIT" else "DEBIT"
+            }
+            val finalCounterpartyAccountId = if (isTransfer) existing?.counterpartyAccountId else null
+            val finalTransferGroupId = if (isTransfer) existing?.transferGroupId else null
+            val finalNeedsReview = if (isTransfer) (existing?.needsReview ?: true) else false
+
             val updated = (existing?.copy(
                 type = type,
                 amount = amount,
@@ -726,7 +790,13 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                 accountId = accountId,
                 paymentMethod = paymentMethod,
                 note = note,
-                isExpense = isExpense,
+                isExpense = finalIsExpense,
+                isInternalTransfer = finalIsInternalTransfer,
+                transactionType = finalTransactionType,
+                direction = finalDirection,
+                counterpartyAccountId = finalCounterpartyAccountId,
+                transferGroupId = finalTransferGroupId,
+                needsReview = finalNeedsReview,
                 updatedAt = now
             )) ?: TransactionEntity(
                 id = id,
@@ -746,7 +816,13 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                 last4Digits = "",
                 createdAt = now,
                 updatedAt = now,
-                isExpense = isExpense
+                isExpense = finalIsExpense,
+                isInternalTransfer = finalIsInternalTransfer,
+                transactionType = finalTransactionType,
+                direction = finalDirection,
+                counterpartyAccountId = finalCounterpartyAccountId,
+                transferGroupId = finalTransferGroupId,
+                needsReview = finalNeedsReview
             )
             repository.insertTransaction(updated)
             MerchantLearningEngine.saveMapping(getApplication(), updated.merchant, updated.categoryId, updated.subcategoryId)

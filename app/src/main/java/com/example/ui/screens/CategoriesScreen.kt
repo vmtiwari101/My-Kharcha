@@ -34,6 +34,9 @@ import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.foundation.lazy.LazyListState
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CategoriesScreen(
@@ -47,8 +50,8 @@ fun CategoriesScreen(
     val allSplits by viewModel.transactionSplits.collectAsState()
 
     var selectedCategoryForDetail by remember { mutableStateOf<CategoryEntity?>(null) }
-    var searchQuery by remember { mutableStateOf("") }
-    var currentTab by remember { mutableStateOf("all") } // "all" or "manage"
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var currentTab by rememberSaveable { mutableStateOf("all") } // "all" or "manage"
 
     // Dialog & Bottom Sheet States
     var subcategoryToOptions by remember { mutableStateOf<SubcategoryEntity?>(null) }
@@ -62,6 +65,21 @@ fun CategoriesScreen(
     var categoryToMerge by remember { mutableStateOf<CategoryEntity?>(null) }
     var categoryToDeleteWithWarning by remember { mutableStateOf<Pair<CategoryEntity, Int>?>(null) }
     var categoryToDeleteConfirm by remember { mutableStateOf<CategoryEntity?>(null) }
+
+    val categoriesListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
+    BackHandler(enabled = subcategoryToOptions != null) { subcategoryToOptions = null }
+    BackHandler(enabled = subcategoryToMove != null) { subcategoryToMove = null }
+    BackHandler(enabled = subcategoryToEdit != null) { subcategoryToEdit = null }
+    BackHandler(enabled = subcategoryToDelete != null) { subcategoryToDelete = null }
+    BackHandler(enabled = subcategoryToChangeIcon != null) { subcategoryToChangeIcon = null }
+    BackHandler(enabled = categoryForNewSubcategory != null) { categoryForNewSubcategory = null }
+    BackHandler(enabled = showAddCategoryDialog) { showAddCategoryDialog = false }
+    BackHandler(enabled = showReorderCategories) { showReorderCategories = false }
+    BackHandler(enabled = categoryToMerge != null) { categoryToMerge = null }
+    BackHandler(enabled = categoryToDeleteWithWarning != null) { categoryToDeleteWithWarning = null }
+    BackHandler(enabled = categoryToDeleteConfirm != null) { categoryToDeleteConfirm = null }
+    BackHandler(enabled = selectedCategoryForDetail != null) { selectedCategoryForDetail = null }
 
     val formatINR: (Double) -> String = { amt ->
         "₹" + NumberFormat.getNumberInstance(Locale("en", "IN")).format(amt)
@@ -207,6 +225,7 @@ fun CategoriesScreen(
                 }
             } else {
                 LazyColumn(
+                    state = categoriesListState,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f),
                     contentPadding = PaddingValues(bottom = 80.dp)
@@ -561,10 +580,11 @@ fun CategorySubcategoriesDetailView(
     onSubcategoryOptions: (SubcategoryEntity) -> Unit,
     onReorderSubcategories: (List<SubcategoryEntity>) -> Unit
 ) {
-    BackHandler(onBack = onBack)
-
     var searchQuery by remember { mutableStateOf("") }
     var showReorderSubcats by remember { mutableStateOf(false) }
+
+    BackHandler(enabled = showReorderSubcats) { showReorderSubcats = false }
+    BackHandler(enabled = !showReorderSubcats, onBack = onBack)
 
     val isDark = isSystemInDarkTheme()
     val bgColor = if (isDark) Color(0xFF0F172A) else Color(0xFFF8FAFC)
@@ -712,7 +732,10 @@ fun CategorySubcategoriesDetailView(
                 }
             }
         } else {
+            val subcatsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
             LazyColumn(
+                state = subcatsListState,
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(bottom = 80.dp)

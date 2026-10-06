@@ -43,12 +43,27 @@ fun EditTransactionDialog(
     val accounts by viewModel.accounts.collectAsState()
     val cards by viewModel.cards.collectAsState()
 
-    var type by remember { mutableStateOf(tx.type) }
+    var type by remember {
+        mutableStateOf(
+            if (tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER") "INTERNAL_TRANSFER"
+            else tx.type
+        )
+    }
     var isExpense by remember { mutableStateOf(tx.isExpense) }
     var amountText by remember { mutableStateOf(if (tx.amount % 1 == 0.0) tx.amount.toLong().toString() else tx.amount.toString()) }
     var merchant by remember { mutableStateOf(tx.merchant) }
-    var selectedCategoryId by remember { mutableStateOf(tx.categoryId) }
-    var selectedSubcategoryId by remember { mutableStateOf(tx.subcategoryId) }
+    var selectedCategoryId by remember {
+        mutableStateOf(
+            if (type == "INTERNAL_TRANSFER") "cat-transfer" else tx.categoryId
+        )
+    }
+    var selectedSubcategoryId by remember {
+        mutableStateOf(
+            if (type == "INTERNAL_TRANSFER") {
+                if (tx.subcategoryId.startsWith("sub-tf-")) tx.subcategoryId else ""
+            } else tx.subcategoryId
+        )
+    }
     var selectedAccountId by remember { mutableStateOf(tx.accountId) }
     var paymentMethod by remember { mutableStateOf(tx.paymentMethod) }
     var date by remember { mutableStateOf(tx.date) }
@@ -78,10 +93,29 @@ fun EditTransactionDialog(
     var newSubcatName by remember { mutableStateOf("") }
     var newSubcatNameHindi by remember { mutableStateOf("") }
 
+    androidx.activity.compose.BackHandler(enabled = showCreateSubcatDialog) {
+        showCreateSubcatDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showCreateCatDialog) {
+        showCreateCatDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showSelectorDialog) {
+        showSelectorDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = subcatDropdownExpanded) {
+        subcatDropdownExpanded = false
+    }
+    androidx.activity.compose.BackHandler(enabled = catDropdownExpanded) {
+        catDropdownExpanded = false
+    }
+    androidx.activity.compose.BackHandler(enabled = !showCreateSubcatDialog && !showCreateCatDialog && !showSelectorDialog && !subcatDropdownExpanded && !catDropdownExpanded) {
+        onDismiss()
+    }
+
     val filteredCategories = categories.filter { 
-        if (type == "INCOME") it.isIncome 
-        else if (type == "INTERNAL_TRANSFER") it.id == "cat-transfer" || !it.isIncome
-        else !it.isIncome 
+        if (type == "INCOME") it.isIncome && it.id != "cat-transfer"
+        else if (type == "INTERNAL_TRANSFER") it.id == "cat-transfer"
+        else !it.isIncome && it.id != "cat-transfer"
     }
     val filteredSubcategories = subcategories.filter { it.categoryId == selectedCategoryId }
 
@@ -215,22 +249,20 @@ fun EditTransactionDialog(
                                 selectedLabelColor = Color.White
                             )
                         )
-                        if (tx.isInternalTransfer || type == "INTERNAL_TRANSFER") {
-                            FilterChip(
-                                selected = type == "INTERNAL_TRANSFER",
-                                onClick = {
-                                    type = "INTERNAL_TRANSFER"
-                                    selectedCategoryId = "cat-transfer"
-                                    selectedSubcategoryId = ""
-                                },
-                                label = { Text("Transfer", fontWeight = FontWeight.Bold) },
-                                modifier = Modifier.weight(1f),
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = Color(0xFF2563EB),
-                                    selectedLabelColor = Color.White
-                                )
+                        FilterChip(
+                            selected = type == "INTERNAL_TRANSFER",
+                            onClick = {
+                                type = "INTERNAL_TRANSFER"
+                                selectedCategoryId = "cat-transfer"
+                                selectedSubcategoryId = ""
+                            },
+                            label = { Text("Transfer", fontWeight = FontWeight.Bold) },
+                            modifier = Modifier.weight(1f),
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFF2563EB),
+                                selectedLabelColor = Color.White
                             )
-                        }
+                        )
                     }
 
                     // 1. EXPENSE ON/OFF TOGGLE (Visible only in Expense mode)

@@ -36,6 +36,7 @@ import com.example.data.entity.TransactionSplitEntity
 import com.example.utils.BankAccountColorResolver
 import com.example.utils.CreditCardColorResolver
 import com.example.utils.CreditCardReminderManager
+import com.example.utils.TransactionIdentityResolver
 import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
@@ -143,70 +144,6 @@ fun CreditCardPaymentReminderSection(
     }
 }
 
-fun calculateAccountBalance(accId: String, accTxs: List<TransactionEntity>, initialBalance: Double = 0.0): Double {
-    var bal = initialBalance
-    for (tx in accTxs) {
-        val isInternal = tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER"
-        if (isInternal) {
-            if (tx.accountId == accId) {
-                bal -= tx.amount
-            } else if (tx.counterpartyAccountId == accId) {
-                bal += tx.amount
-            } else {
-                val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
-                val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
-                if (isCredit) bal += tx.amount
-                else if (isDebit) bal -= tx.amount
-            }
-        } else {
-            val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
-            val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
-            if (isCredit) bal += tx.amount
-            else if (isDebit) bal -= tx.amount
-        }
-    }
-    return bal
-}
-
-private fun isCreditCardPurchase(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
-    val isDebit = (tx.direction == "DEBIT" || tx.type == "EXPENSE") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER" && tx.transactionType != "CARD_PAYMENT"
-    if (!isDebit) return false
-
-    if (cardId != null && tx.cardId == cardId) return true
-    if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-    if (last4.length == 4 && tx.last4Digits == last4) {
-        val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
-        return text.contains("credit card") || text.contains("credit-card") || text.contains("cc ending") || text.contains("card ending") || tx.paymentMethod.contains("card", true)
-    }
-    return false
-}
-
-private fun isCreditCardPaymentOrRefund(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
-    val isPaymentIdentifier = tx.transactionType == "CARD_PAYMENT" || tx.merchant.contains("Credit Card Bill Payment", true) ||
-            tx.note.contains("credit card payment", true) || tx.note.contains("cc payment", true) ||
-            tx.note.contains("payment received towards your credit card", true) || tx.note.contains("paid towards credit card", true)
-
-    if (isPaymentIdentifier) {
-        if (accountId.isNotEmpty() && tx.counterpartyAccountId == accountId) return true
-        if (cardId != null && tx.counterpartyAccountId == cardId) return true
-        if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-        if (last4.length == 4 && tx.last4Digits == last4) return true
-    }
-
-    val isCredit = (tx.direction == "CREDIT" || tx.type == "INCOME") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER"
-    if (isCredit) {
-        if (cardId != null && tx.cardId == cardId) return true
-        if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-        if (last4.length == 4 && tx.last4Digits == last4) {
-            val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
-            return text.contains("refund") || text.contains("cashback") || text.contains("reversal") || text.contains("credit card")
-        }
-    }
-
-    return false
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AccountsScreen(
     viewModel: KharchaViewModel
@@ -218,8 +155,8 @@ fun AccountsScreen(
     val allSplits by viewModel.transactionSplits.collectAsState()
     val cards by viewModel.cards.collectAsState()
 
-    var selectedAccountIdForHistory by remember { mutableStateOf<String?>(null) }
-    var selectedTypeFilter by remember { mutableStateOf("All") }
+    var selectedAccountIdForHistory by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedTypeFilter by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("All") }
     var showEditDialog by remember { mutableStateOf<AccountEntity?>(null) }
     var showArchiveConfirm by remember { mutableStateOf<AccountEntity?>(null) }
     var showDeleteConfirm by remember { mutableStateOf<AccountEntity?>(null) }
@@ -227,7 +164,41 @@ fun AccountsScreen(
     var showEditCardDialog by remember { mutableStateOf<CardEntity?>(null) }
     var showAddAccountCustomDialog by remember { mutableStateOf(false) }
     var selectedTxDetail by remember { mutableStateOf<TransactionEntity?>(null) }
-    var showAllCreditCardsScreen by remember { mutableStateOf(false) }
+    var selectedTxToEdit by remember { mutableStateOf<TransactionEntity?>(null) }
+    var showAllCreditCardsScreen by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+
+    val accountsListState = androidx.compose.runtime.saveable.rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+
+    androidx.activity.compose.BackHandler(enabled = selectedTxToEdit != null) {
+        selectedTxToEdit = null
+    }
+    androidx.activity.compose.BackHandler(enabled = selectedTxDetail != null && selectedTxToEdit == null) {
+        selectedTxDetail = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showEditCardDialog != null) {
+        showEditCardDialog = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showManageCardsDialog) {
+        showManageCardsDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showAddAccountCustomDialog) {
+        showAddAccountCustomDialog = false
+    }
+    androidx.activity.compose.BackHandler(enabled = showDeleteConfirm != null) {
+        showDeleteConfirm = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showArchiveConfirm != null) {
+        showArchiveConfirm = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showEditDialog != null) {
+        showEditDialog = null
+    }
+    androidx.activity.compose.BackHandler(enabled = selectedAccountIdForHistory != null) {
+        selectedAccountIdForHistory = null
+    }
+    androidx.activity.compose.BackHandler(enabled = showAllCreditCardsScreen) {
+        showAllCreditCardsScreen = false
+    }
 
     val formatINR: (Double) -> String = { amt ->
         "₹" + NumberFormat.getNumberInstance(Locale("en", "IN")).format(amt)
@@ -303,7 +274,19 @@ fun AccountsScreen(
             TransactionDetailDialog(
                 tx = selectedTxDetail!!,
                 viewModel = viewModel,
-                onDismiss = { selectedTxDetail = null }
+                onDismiss = { selectedTxDetail = null },
+                onEdit = { tx ->
+                    selectedTxDetail = null
+                    selectedTxToEdit = tx
+                }
+            )
+        }
+
+        if (selectedTxToEdit != null) {
+            EditTransactionDialog(
+                tx = selectedTxToEdit!!,
+                viewModel = viewModel,
+                onDismiss = { selectedTxToEdit = null }
             )
         }
         return
@@ -435,7 +418,7 @@ fun AccountsScreen(
         // Summary Net Flow Card
         val totalActiveExpense = transactions.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
         val totalActiveIncome = transactions.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
-        val totalNetBalance = activeAccounts.sumOf { acc ->
+        val totalNetBalance: Double = activeAccounts.sumOf { acc ->
             val aTxs = transactions.filter { 
                 it.accountId == acc.id || 
                 it.counterpartyAccountId == acc.id || 
@@ -627,6 +610,7 @@ fun AccountsScreen(
         }
 
         LazyColumn(
+            state = accountsListState,
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(bottom = 120.dp)
         ) {
@@ -687,7 +671,7 @@ fun AccountsScreen(
                                     }
                                     false
                                 }
-                                val totalExpense = accTxs.filter { it.type == "EXPENSE" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
+                                val totalExpense = accTxs.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
                                 val totalIncome = accTxs.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
                                 val accountBalance = calculateAccountBalance(acc.id, accTxs, acc.initialBalance)
 
@@ -703,10 +687,12 @@ fun AccountsScreen(
                                 )
 
                                 if (isCreditCardAcc) {
-                                    val expenseTotal = accTxs.filter { isCreditCardPurchase(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
-                                    val paymentTotal = accTxs.filter { isCreditCardPaymentOrRefund(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
-                                    val txOutstanding = Math.max(0.0, expenseTotal - paymentTotal)
-                                    val effectiveOutstanding = if (txOutstanding > 0.0) txOutstanding else acc.outstandingAmount
+                                    val expenseTotal = accTxs.filter { com.example.utils.TransactionIdentityResolver.isCreditCardPurchase(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
+                                    val paymentTotal = accTxs.filter { com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
+                                    
+                                    // Use anchored calculation for Credit Cards: initialBalance (representing Initial Debt) + current net transactions.
+                                    // This ensures that balance updates from SMS/Notifications are respected as the 'anchor' point.
+                                    val effectiveOutstanding = Math.max(0.0, acc.initialBalance + (expenseTotal - paymentTotal))
 
                                     val latestTx = accTxs.maxByOrNull { it.date + it.time }
                                     CreditCardAccountManagementCard(
@@ -1906,13 +1892,13 @@ fun AccountHistoryView(
     }
 
     val totalExpenses = if (isCreditCard) {
-        accTxs.filter { isCreditCardPurchase(it, null, accId, accLast4) }.sumOf { it.amount }
+        accTxs.filter { TransactionIdentityResolver.isCreditCardPurchase(it, null, accId, accLast4) }.sumOf { it.amount }
     } else {
-        accTxs.filter { it.type == "EXPENSE" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
+        accTxs.filter { it.type == "EXPENSE" && it.isExpense && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
     }
 
     val totalIncome = if (isCreditCard) {
-        accTxs.filter { isCreditCardPaymentOrRefund(it, null, accId, accLast4) }.sumOf { it.amount }
+        accTxs.filter { TransactionIdentityResolver.isCreditCardPaymentOrRefund(it, null, accId, accLast4) }.sumOf { it.amount }
     } else {
         accTxs.filter { it.type == "INCOME" && !it.isInternalTransfer && it.transactionType != "INTERNAL_TRANSFER" }.sumOf { it.amount }
     }
@@ -1982,7 +1968,10 @@ fun AccountHistoryView(
             }
         }
 
+        val historyListState = androidx.compose.runtime.saveable.rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
+
         LazyColumn(
+            state = historyListState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 16.dp),
@@ -2964,4 +2953,28 @@ fun EditAccountDialog(
             }
         }
     )
+}
+
+fun calculateAccountBalance(accountId: String, transactions: List<TransactionEntity>, initialBalance: Double): Double {
+    var balance = initialBalance
+    transactions.forEach { tx ->
+        val isInternal = tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER"
+        if (isInternal) {
+            if (tx.accountId == accountId) {
+                balance -= tx.amount
+            } else if (tx.counterpartyAccountId == accountId) {
+                balance += tx.amount
+            }
+        } else {
+            val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
+            val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
+            if (tx.accountId == accountId) {
+                if (isCredit) balance += tx.amount
+                else if (isDebit) balance -= tx.amount
+            } else if (tx.counterpartyAccountId == accountId) {
+                balance += tx.amount
+            }
+        }
+    }
+    return balance
 }

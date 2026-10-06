@@ -30,6 +30,9 @@ import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.foundation.lazy.LazyListState
+
 data class UnifiedCreditCard(
     val id: String,
     val accountId: String,
@@ -268,6 +271,8 @@ fun AllCreditCardsScreen(
         list
     }
 
+    val cardsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -295,6 +300,7 @@ fun AllCreditCardsScreen(
         )
 
         LazyColumn(
+            state = cardsListState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp),

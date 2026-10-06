@@ -32,6 +32,9 @@ import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
 
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.foundation.lazy.LazyListState
+
 @Composable
 fun TransactionsScreen(
     viewModel: KharchaViewModel,
@@ -45,8 +48,19 @@ fun TransactionsScreen(
     val allSplits by viewModel.transactionSplits.collectAsState()
     val subTab by viewModel.transactionSubTab.collectAsState()
 
-    var selectedCategoryId by remember { mutableStateOf<String?>(null) }
-    var selectedMerchantName by remember { mutableStateOf<String?>(null) }
+    var selectedCategoryId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedMerchantName by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val txsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    val catsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    val merchantsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
+    BackHandler(enabled = selectedCategoryId != null) {
+        selectedCategoryId = null
+    }
+    BackHandler(enabled = selectedMerchantName != null) {
+        selectedMerchantName = null
+    }
 
     val formatINR: (Double) -> String = { amt ->
         "₹" + NumberFormat.getNumberInstance(Locale("en", "IN")).format(amt)
@@ -191,8 +205,8 @@ fun TransactionsScreen(
 
         when (subTab) {
             "txs" -> {
-                var selectedSourceFilter by remember { mutableStateOf("All") }
-                var selectedAccountIdFilter by remember { mutableStateOf("ALL") }
+                var selectedSourceFilter by rememberSaveable { mutableStateOf("All") }
+                var selectedAccountIdFilter by rememberSaveable { mutableStateOf("ALL") }
 
                 val filteredTxs = transactions.filter { tx ->
                     val matchesSource = when (selectedSourceFilter) {
@@ -268,6 +282,7 @@ fun TransactionsScreen(
                     EmptyStateBox("No transactions yet", "Tap the + button to add your first transaction.", onOpenAddExpense)
                 } else {
                     LazyColumn(
+                        state = txsListState,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(bottom = 96.dp)
                     ) {
@@ -312,6 +327,7 @@ fun TransactionsScreen(
                     }.sortedByDescending { it.second.first }
 
                     LazyColumn(
+                        state = catsListState,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(bottom = 96.dp)
                     ) {
@@ -421,6 +437,7 @@ fun TransactionsScreen(
                     }.sortedByDescending { it.totalSpending }
 
                     LazyColumn(
+                        state = merchantsListState,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(bottom = 96.dp)
                     ) {
@@ -705,7 +722,10 @@ fun CategoryDrillDownView(
 
         Spacer(modifier = Modifier.height(14.dp))
 
+        val categoryDrillListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
         LazyColumn(
+            state = categoryDrillListState,
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(bottom = 96.dp),
             modifier = Modifier.fillMaxWidth()
@@ -1080,7 +1100,10 @@ fun MerchantDrillDownView(
 
         Spacer(modifier = Modifier.height(14.dp))
 
+        val merchantDrillListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
         LazyColumn(
+            state = merchantDrillListState,
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(bottom = 96.dp),
             modifier = Modifier.fillMaxSize()

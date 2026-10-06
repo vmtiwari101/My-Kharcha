@@ -126,7 +126,9 @@ object EmailParser {
     }
 
     private fun extractAmount(content: String): Double {
-        val cleanContent = content.replace(Regex("avbl\\s*bal[\\s\\S]*", RegexOption.IGNORE_CASE), "")
+        val balanceKeywords = "available\\s*balance|avbl?\\s*bal|avl\\s*bal|current\\s*balance|curr\\s*bal|new\\s*balance|new\\s*bal|closing\\s*balance|ledger\\s*balance|account\\s*balance|credit\\s*limit|available\\s*limit|avbl?\\s*limit|outstanding\\s*amount|outstanding\\s*bal(?:ance)?|statement\\s*balance|balance|bal|limit|outstanding"
+        val cleanContent = content.replace(Regex("(?:$balanceKeywords)\\s*(?:is|of|to|for|:)?\\s*(?:rs\\.?|inr|₹)?\\s*[\\d,.]+", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("avbl\\s*bal[\\s\\S]*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("available\\s*balance[\\s\\S]*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("balance[\\s\\S]*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("limit[\\s\\S]*", RegexOption.IGNORE_CASE), "")

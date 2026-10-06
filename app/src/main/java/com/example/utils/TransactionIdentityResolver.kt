@@ -43,100 +43,139 @@ object TransactionIdentityResolver {
         val bankNameCandidate = evidence.bankNameCandidate.ifEmpty { extractBankName(textLower, evidence.source, last4) }.trim()
         val bankName = sanitizeBankName(bankNameCandidate)
 
-        // 1. High Confidence: EXACT Last-4 (exactly 4 digits) + Bank Name Match
-        if (last4.length == 4 && bankName.isNotEmpty()) {
-            // Check cards first
-            val matchedCards = cards.filter { card ->
-                card.last4Digits == last4 && 
-                isBankNameMatch(card.name, bankName, accounts.find { it.id == card.accountId })
-            }
-            if (matchedCards.size == 1) {
+        val isBillPayment = textLower.contains("bill payment") || textLower.contains("towards payment") || 
+            textLower.contains("paid towards") || textLower.contains("cc payment") || textLower.contains("credit card payment")
+
+        val isIncomingCreditCard = (textLower.contains("credit card") || textLower.contains("credit-card") || 
+            textLower.contains("cc ending") || evidence.cardTypeCandidate.contains("credit", true)) && !isBillPayment
+
+        val isIncomingBankAccount = (textLower.contains("a/c") || textLower.contains("ac ") || 
+            textLower.contains("account") || textLower.contains("savings") || textLower.contains("current") || 
+            textLower.contains("bank account")) && !isIncomingCreditCard
+
+        // 1. High Confidence: EXACT Last-4 (4 digits)
+        if (last4.length == 4) {
+            val allCardsWithLast4 = cards.filter { it.last4Digits == last4 }
+            val allAccsWithLast4 = accounts.filter { it.last4Digits == last4 }
+
+            // Check if multiple distinct banks share this last4
+            val distinctBanks = (allCardsWithLast4.map { card ->
+                val acc = accounts.find { it.id == card.accountId }
+                normalizeBankName(acc?.bankName?.ifEmpty { acc.name } ?: card.name)
+            } + allAccsWithLast4.map { acc ->
+                normalizeBankName(acc.bankName.ifEmpty { acc.name })
+            }).filter { it.isNotEmpty() }.toSet()
+
+            // If bank name is missing in evidence AND multiple distinct banks exist with this last4, it's ambiguous!
+            if (bankName.isEmpty() && distinctBanks.size > 1) {
                 return ResolutionResult(
-                    accountId = matchedCards[0].accountId,
-                    cardId = matchedCards[0].id,
-                    last4Digits = matchedCards[0].last4Digits,
+                    accountId = "",
+                    cardId = null,
+                    last4Digits = last4,
+                    needsReview = true,
+                    confidence = 20,
+                    paymentMethod = resolvePaymentMethod(methodText)
+                )
+            }
+
+            // Filter cards matching bank (if bankName given)
+            val matchedCards = allCardsWithLast4.filter { card ->
+                bankName.isEmpty() || isBankNameMatch(card.name, bankName, accounts.find { it.id == card.accountId })
+            }
+
+            // Filter accounts matching bank (if bankName given)
+            val matchedAccs = allAccsWithLast4.filter { acc ->
+                bankName.isEmpty() || isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName, null)
+            }
+
+            // If incoming is specifically Credit Card
+            if (isIncomingCreditCard) {
+                if (matchedCards.size == 1) {
+                    val card = matchedCards[0]
+                    return ResolutionResult(
+                        accountId = card.accountId,
+                        cardId = card.id,
+                        last4Digits = card.last4Digits,
+                        needsReview = false,
+                        confidence = 100,
+                        paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, "Credit Card") }
+                    )
+                }
+                val ccAccs = matchedAccs.filter { it.type.equals("Credit Card", true) }
+                if (ccAccs.size == 1) {
+                    val acc = ccAccs[0]
+                    return ResolutionResult(
+                        accountId = acc.id,
+                        cardId = cards.find { it.accountId == acc.id }?.id,
+                        last4Digits = acc.last4Digits,
+                        needsReview = false,
+                        confidence = 95,
+                        paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, "Credit Card") }
+                    )
+                }
+            }
+
+            // If incoming is specifically Bank Account (or not explicitly credit card)
+            val bankAccs = matchedAccs.filter { !it.type.equals("Credit Card", true) }
+            if (bankAccs.size == 1 && (isIncomingBankAccount || matchedCards.isEmpty())) {
+                val acc = bankAccs[0]
+                return ResolutionResult(
+                    accountId = acc.id,
+                    cardId = null,
+                    last4Digits = acc.last4Digits,
+                    needsReview = false,
+                    confidence = 95,
+                    paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, acc.type) }
+                )
+            }
+
+            // If only 1 card matched and no bank account matched
+            if (matchedCards.size == 1 && bankAccs.isEmpty()) {
+                val card = matchedCards[0]
+                return ResolutionResult(
+                    accountId = card.accountId,
+                    cardId = card.id,
+                    last4Digits = card.last4Digits,
                     needsReview = false,
                     confidence = 100,
                     paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, "Credit Card") }
                 )
             }
 
-            // Check accounts
-            val matchedAccs = accounts.filter { acc ->
-                acc.last4Digits == last4 && 
-                isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName, null)
-            }
-            if (matchedAccs.size == 1) {
+            // If 1 account matched overall (e.g. standalone credit card account)
+            if (matchedAccs.size == 1 && matchedCards.isEmpty()) {
+                val acc = matchedAccs[0]
                 return ResolutionResult(
-                    accountId = matchedAccs[0].id,
-                    cardId = null,
-                    last4Digits = matchedAccs[0].last4Digits,
+                    accountId = acc.id,
+                    cardId = cards.find { it.accountId == acc.id }?.id,
+                    last4Digits = acc.last4Digits,
                     needsReview = false,
                     confidence = 95,
-                    paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, matchedAccs[0].type) }
+                    paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, acc.type) }
                 )
             }
-        }
 
-        // 2. Medium Confidence: Unique EXACT Last-4 Match (Safety first: only if no bank conflict)
-        if (last4.length == 4) {
-            val matchedCards = cards.filter { it.last4Digits == last4 }
-            val matchedAccs = accounts.filter { it.last4Digits == last4 }
-
-            // Deduplicate: If a card is matched, its account is also matched.
-            val uniqueAccountIds = (matchedCards.map { it.accountId } + matchedAccs.map { it.id }).toSet()
-
-            if (uniqueAccountIds.size == 1) {
-                val matchedAccountId = uniqueAccountIds.first()
-                val matchedAcc = accounts.find { it.id == matchedAccountId }
-                val matchedCard = matchedCards.find { it.accountId == matchedAccountId }
-
-                // If bank name was extracted and it CONFLICTS with the unique match, we should be cautious
-                val potentialMatchBank = matchedAcc?.bankName?.ifEmpty { matchedAcc.name } ?: matchedCard?.name ?: ""
-
-                if (bankName.isEmpty() || isBankNameMatch(potentialMatchBank, bankName, null)) {
-                    return ResolutionResult(
-                        accountId = matchedAccountId,
-                        cardId = matchedCard?.id,
-                        last4Digits = last4,
-                        needsReview = false,
-                        confidence = 95, // High confidence for exact 4-digit unique match
-                        paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, matchedCard?.type ?: matchedAcc?.type) }
-                    )
-                }
-            } else if (uniqueAccountIds.size > 1) {
-                // Ambiguity detected! Try to filter by bank name if available
-                if (bankName.isNotEmpty()) {
-                    val filteredCards = matchedCards.filter { card -> isBankNameMatch(card.name, bankName, accounts.find { acc -> acc.id == card.accountId }) }
-                    val filteredAccs = matchedAccs.filter { acc -> isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName, null) }
-                    
-                    val filteredAccountIds = (filteredCards.map { it.accountId } + filteredAccs.map { it.id }).toSet()
-                    
-                    if (filteredAccountIds.size == 1) {
-                        val matchedAccountId = filteredAccountIds.first()
-                        val matchedAcc = accounts.find { it.id == matchedAccountId }
-                        val matchedCard = matchedCards.find { it.accountId == matchedAccountId }
-                        
-                        return ResolutionResult(
-                            accountId = matchedAccountId,
-                            cardId = matchedCard?.id,
-                            last4Digits = last4,
-                            needsReview = false,
-                            confidence = 95,
-                            paymentMethod = evidence.paymentMethodCandidate.ifEmpty { resolvePaymentMethod(methodText, matchedCard?.type ?: matchedAcc?.type) }
-                        )
-                    }
-                }
-                
+            // If bank name conflict (bankName specified, but no matching entities)
+            if (bankName.isNotEmpty() && matchedCards.isEmpty() && matchedAccs.isEmpty()) {
                 return ResolutionResult(
                     accountId = "",
                     cardId = null,
                     last4Digits = last4,
                     needsReview = true,
-                    confidence = 30, // Low confidence due to ambiguity
+                    confidence = 20,
                     paymentMethod = resolvePaymentMethod(methodText)
                 )
             }
+
+            // Ambiguity fallback for last4
+            return ResolutionResult(
+                accountId = "",
+                cardId = null,
+                last4Digits = last4,
+                needsReview = true,
+                confidence = 30,
+                paymentMethod = resolvePaymentMethod(methodText)
+            )
         }
 
         // 3. Partial last4 (2 or 3 digits) - NEVER high confidence
@@ -224,6 +263,7 @@ object TransactionIdentityResolver {
 
     fun sanitizeTextForBankExtraction(rawText: String): String {
         return rawText
+            .replace(Regex("(?i)powered\\s+by\\s+[a-z0-9\\s]*axis(?:\\s*bank)?"), " ")
             .replace(Regex("(?i)(?:powered|provided|supported)\\s*[:\\-]?\\s*by\\s*[:\\-]?\\s*[a-z0-9\\s/]{1,40}(?:bank)?"), " ")
             .replace(Regex("(?i)upi\\s*[:\\-]?\\s*psp\\s*[a-z0-9\\s/]{1,40}"), " ")
             .replace(Regex("(?i)partner\\s*[:\\-]?\\s*bank\\s*[a-z0-9\\s/]{1,40}"), " ")
@@ -440,6 +480,50 @@ object TransactionIdentityResolver {
             lower.contains("net banking") || lower.contains("bank transfer") || lower.contains("imps") || lower.contains("neft") || lower.contains("rtgs") -> "Bank Transfer"
             else -> "Other"
         }
+    }
+
+    /**
+     * Checks if a transaction is a credit card purchase/expense.
+     */
+    fun isCreditCardPurchase(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
+        val isDebit = (tx.direction == "DEBIT" || tx.type == "EXPENSE") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER" && tx.transactionType != "CARD_PAYMENT"
+        if (!isDebit) return false
+
+        if (cardId != null && tx.cardId == cardId) return true
+        if (accountId.isNotEmpty() && tx.accountId == accountId) return true
+        if (last4.length == 4 && tx.last4Digits == last4) {
+            val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
+            return text.contains("credit card") || text.contains("credit-card") || text.contains("cc ending") || text.contains("card ending") || tx.paymentMethod.contains("card", true)
+        }
+        return false
+    }
+
+    /**
+     * Checks if a transaction is a credit card bill payment or refund.
+     */
+    fun isCreditCardPaymentOrRefund(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
+        val isPaymentIdentifier = tx.transactionType == "CARD_PAYMENT" || tx.merchant.contains("Credit Card Bill Payment", true) ||
+                tx.note.contains("credit card payment", true) || tx.note.contains("cc payment", true) ||
+                tx.note.contains("payment received towards your credit card", true) || tx.note.contains("paid towards credit card", true)
+
+        if (isPaymentIdentifier) {
+            if (accountId.isNotEmpty() && tx.counterpartyAccountId == accountId) return true
+            if (cardId != null && tx.counterpartyAccountId == cardId) return true
+            if (accountId.isNotEmpty() && tx.accountId == accountId) return true
+            if (last4.length == 4 && tx.last4Digits == last4) return true
+        }
+
+        val isCredit = (tx.direction == "CREDIT" || tx.type == "INCOME") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER"
+        if (isCredit) {
+            if (cardId != null && tx.cardId == cardId) return true
+            if (accountId.isNotEmpty() && tx.accountId == accountId) return true
+            if (last4.length == 4 && tx.last4Digits == last4) {
+                val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
+                return text.contains("refund") || text.contains("cashback") || text.contains("reversal") || text.contains("credit card")
+            }
+        }
+
+        return false
     }
 
     /**
