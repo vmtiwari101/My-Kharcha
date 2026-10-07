@@ -105,6 +105,40 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     var lastMainTab = MutableStateFlow("home")
 
     init {
+        dao = AppDatabase.getDatabase(application).kharchaDao()
+        repository = KharchaRepository(dao)
+
+        transactions = repository.allTransactions.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+        categories = repository.allCategories.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+        subcategories = repository.allSubcategories.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+        accounts = repository.allAccounts.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+        transactionSplits = repository.allSplits.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+        cards = repository.allCards.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
         try {
             firebaseAuth = FirebaseAuth.getInstance().also {
                 it.addAuthStateListener(emailAuthStateListener)
@@ -112,8 +146,6 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: Exception) {
             Log.w("KharchaViewModel", "Firebase authentication listener is unavailable", e)
         }
-        dao = AppDatabase.getDatabase(application).kharchaDao()
-        repository = KharchaRepository(dao)
 
         val hasSms = androidx.core.content.ContextCompat.checkSelfPermission(
             application,
@@ -177,42 +209,6 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         } else {
             "Never scanned"
         }
-
-        transactions = repository.allTransactions.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-        categories = repository.allCategories.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-        subcategories = repository.allSubcategories.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-        accounts = repository.allAccounts.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-        transactionSplits = repository.allSplits.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-        cards = repository.allCards.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
 
         // Perform one-time duplicate cleanup, category expansion, and merchant normalization on startup
         viewModelScope.launch(Dispatchers.IO) {

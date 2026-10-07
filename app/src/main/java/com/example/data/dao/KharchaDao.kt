@@ -214,7 +214,7 @@ interface KharchaDao {
             second.counterpartyAccountId != first.accountId ||
             !isTransferRecord(first) || !isTransferRecord(second) ||
             first.direction != "DEBIT" && first.direction != "CREDIT" ||
-            second.direction != if (first.direction == "DEBIT") "CREDIT" else "DEBIT" ||
+            second.direction != (if (first.direction == "DEBIT") "CREDIT" else "DEBIT") ||
             kotlin.math.abs(first.amount - second.amount) >= 0.01
         ) return false
 
@@ -382,6 +382,10 @@ interface KharchaDao {
             transaction.transactionType == "INTERNAL_TRANSFER" ||
             transaction.transactionType == "CARD_PAYMENT" ||
             transaction.transactionType == "CREDIT_CARD_BILL_PAYMENT"
+
+    private suspend fun getAccountCountForUser(userId: String, id: String): Int =
+        getAllAccountsSyncForUser(userId).count { it.id == id && it.userId == userId } +
+            getAllCardsSyncForUser(userId).count { it.id == id && it.userId == userId }
 
     private suspend fun isOwnedAccountOrCard(userId: String, id: String): Boolean {
         if (id.isBlank()) return false

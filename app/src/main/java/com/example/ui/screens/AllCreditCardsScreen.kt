@@ -149,7 +149,7 @@ fun AllCreditCardsScreen(
             val paymentTotal = linkedTxs.filter { isCreditCardPaymentOrRefund(it, card.id, effectiveAccId, last4) }.sumOf { it.amount }
             val storedOutstanding = maxOf(parentAcc?.outstandingAmount ?: 0.0, card.outstandingAmount)
             val hasBalanceActivity = expenseTotal > 0.0 || paymentTotal > 0.0
-            val effectiveOutstanding = if (parentAcc?.type.equals("Credit Card", ignoreCase = true)) {
+            val effectiveOutstanding = if (parentAcc != null && parentAcc.type.equals("Credit Card", ignoreCase = true)) {
                 if (hasBalanceActivity || parentAcc.initialBalance != 0.0) {
                     com.example.utils.TransactionIdentityResolver.creditCardOutstandingFromAnchor(
                         parentAcc.initialBalance,

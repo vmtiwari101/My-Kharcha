@@ -3031,12 +3031,13 @@ fun calculateAccountBalance(accountId: String, transactions: List<TransactionEnt
                 balance += tx.amount
             }
 
-            fun openingBalanceForCurrentBalance(
-                accountId: String,
-                transactions: List<TransactionEntity>,
-                currentBalance: Double
-            ): Double = currentBalance - calculateAccountBalance(accountId, transactions, 0.0)
         }
     }
     return balance
 }
+
+fun openingBalanceForCurrentBalance(
+    accountId: String,
+    transactions: List<TransactionEntity>,
+    currentBalance: Double
+): Double = currentBalance - calculateAccountBalance(accountId, transactions, 0.0)

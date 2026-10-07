@@ -360,7 +360,7 @@ object CreditCardBillIngestionEngine {
                 account = updatedAccount,
                 card = updatedCard,
                 includedPaymentIds = recentPayments.map { it.id },
-                targetIds = listOf(accId, cardId).filter { it.isNotBlank() }
+                targetIds = listOfNotNull(accId, cardId).filter { it.isNotBlank() }
             )
         ) {
             return@withContext BillIngestionResult.InvalidData

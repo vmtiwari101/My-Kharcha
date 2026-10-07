@@ -409,6 +409,7 @@ object TransactionIngestionEngine {
                 ?.substringAfter('-', "")
             "NOTIFICATION" -> original.takeIf { it.startsWith("NOTIF-EVENT-", ignoreCase = true) }
                 ?.substringAfter("NOTIF-EVENT-", "")
+            else -> null
         }?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         val normalizedId = eventId.uppercase(Locale.US).replace("[^A-Z0-9]".toRegex(), "")
         return normalizedId.takeIf { it.isNotEmpty() }?.let { "$source:$it" }
