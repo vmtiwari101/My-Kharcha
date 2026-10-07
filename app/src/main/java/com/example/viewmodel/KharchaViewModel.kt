@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.database.AppDatabase
+import com.example.data.dao.KharchaDao
 import com.example.data.dao.SafeDeleteResult
 import com.example.data.dao.SplitOperationResult
 import com.example.data.entity.AccountEntity
@@ -55,6 +56,7 @@ sealed class HistoricalScanState {
 }
 
 class KharchaViewModel(application: Application) : AndroidViewModel(application) {
+    private val dao: KharchaDao
     private val repository: KharchaRepository
 
     val transactions: StateFlow<List<TransactionEntity>>
@@ -110,7 +112,7 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         } catch (e: Exception) {
             Log.w("KharchaViewModel", "Firebase authentication listener is unavailable", e)
         }
-        val dao = AppDatabase.getDatabase(application).kharchaDao()
+        dao = AppDatabase.getDatabase(application).kharchaDao()
         repository = KharchaRepository(dao)
 
         val hasSms = androidx.core.content.ContextCompat.checkSelfPermission(
@@ -217,7 +219,7 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
             com.example.data.DefaultCategoryData.restoreAndExpandCategoriesAndSubcategories(dao)
             repository.cleanupDuplicateTransactions()
             TransactionIngestionEngine.normalizeExistingTransactions(dao)
-            com.example.utils.CreditCardReminderManager.rescheduleAllAsync(application)
+            com.example.utils.CreditCardReminderManager.rescheduleAllAsync(getApplication<Application>())
             repairIdentityMappingIfNeeded(dao)
         }
     }
