@@ -35,21 +35,47 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Create debug keystore
+      - name: Configure stable debug keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          keytool -genkeypair \
-            -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          set -euo pipefail
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "::error::Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD in GitHub Actions Secrets."
+            exit 1
+          fi
+
+          keystore_path="$RUNNER_TEMP/my-kharcha-debug.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          chmod 600 "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+          cat > "$RUNNER_TEMP/android-signing.init.gradle" <<'GRADLE'
+          gradle.beforeProject { project ->
+            if (project.path == ':app') {
+              project.afterEvaluate {
+                def android = project.extensions.findByName('android')
+                def signing = android.signingConfigs.create('githubActionsDebug')
+                signing.storeFile = new File(System.getenv('ANDROID_KEYSTORE_PATH'))
+                signing.storePassword = System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                signing.keyAlias = System.getenv('ANDROID_KEY_ALIAS')
+                signing.keyPassword = System.getenv('ANDROID_KEY_PASSWORD')
+                android.buildTypes.getByName('debug').signingConfig = signing
+              }
+            }
+          }
+          GRADLE
+          echo "ANDROID_SIGNING_INIT_SCRIPT=$RUNNER_TEMP/android-signing.init.gradle" >> "$GITHUB_ENV"
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle --init-script "$ANDROID_SIGNING_INIT_SCRIPT" assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

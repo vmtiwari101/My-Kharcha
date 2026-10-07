@@ -229,36 +229,23 @@ object AuthManager {
                 context = activity
             )
         } catch (e: GetCredentialCancellationException) {
-            Log.w(TAG, "Google Sign-In cancelled by user", e)
+            Log.i(TAG, "Google Sign-In cancelled (${e::class.java.simpleName}): ${e.message}")
             return@withContext Result.failure(Exception("Sign-in cancelled. Please select your Google account to continue."))
         } catch (e: GetCredentialException) {
-            Log.w(TAG, "Primary credential request failed: ${e.message}", e)
-            try {
-                val fallbackRequest = GetCredentialRequest.Builder()
-                    .addCredentialOption(signInWithGoogleOption)
-                    .build()
-                credentialManager.getCredential(
-                    request = fallbackRequest,
-                    context = activity
-                )
-            } catch (fallbackEx: GetCredentialCancellationException) {
-                Log.w(TAG, "Google Sign-In fallback cancelled by user", fallbackEx)
-                return@withContext Result.failure(Exception("Sign-in cancelled. Please select your Google account to continue."))
-            } catch (fallbackEx: GetCredentialException) {
-                Log.e(TAG, "Google Sign-In credential exception: ${fallbackEx.message}, Type: ${fallbackEx::class.java.simpleName}", fallbackEx)
-                val isNoCredential = fallbackEx.message?.contains("28433") == true ||
-                        fallbackEx.message?.contains("matching credential", ignoreCase = true) == true ||
-                        fallbackEx.message?.contains("NoCredentialException", ignoreCase = true) == true
-                val errorMsg = if (isNoCredential) {
-                    "No Google account selected or available. Please ensure a Google account is logged in on this device and try again."
-                } else {
-                    "Google Sign-In failed: ${fallbackEx.message}"
-                }
-                return@withContext Result.failure(Exception(errorMsg))
+            val errorDetail = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
+            Log.e(TAG, "Google credential request failed (${e::class.java.simpleName}): $errorDetail")
+            val isNoCredential = e::class.java.simpleName == "NoCredentialException" ||
+                e.message?.contains("matching credential", ignoreCase = true) == true
+            val errorMessage = if (isNoCredential) {
+                "No Google account is available. Add a Google account to this device and try again."
+            } else {
+                "Google Sign-In failed: $errorDetail"
             }
+            return@withContext Result.failure(Exception(errorMessage))
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error in credential retrieval: ${e.message}, Type: ${e::class.java.simpleName}", e)
-            return@withContext Result.failure(Exception("Authentication failed: ${e.message}"))
+            val errorDetail = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
+            Log.e(TAG, "Unexpected Google credential error (${e::class.java.simpleName}): $errorDetail")
+            return@withContext Result.failure(Exception("Google Sign-In failed: $errorDetail"))
         }
 
         try {
@@ -286,8 +273,11 @@ object AuthManager {
                     val authResult = FirebaseAuth.getInstance().signInWithCredential(authCredential).await()
                     authResult.user
                 } catch (e: Exception) {
-                    Log.e(TAG, "Firebase Authentication with Google ID Token failed: ${e.message}", e)
-                    return@withContext Result.failure(Exception("Firebase authentication failed: ${e.localizedMessage ?: e.message}"))
+                    val errorDetail = e.localizedMessage?.takeIf { it.isNotBlank() }
+                        ?: e.message?.takeIf { it.isNotBlank() }
+                        ?: e::class.java.simpleName
+                    Log.e(TAG, "Firebase Google authentication failed (${e::class.java.simpleName}): $errorDetail")
+                    return@withContext Result.failure(Exception("Firebase authentication failed: $errorDetail"))
                 }
 
                 // Obtain the Firebase UID
@@ -308,8 +298,11 @@ object AuthManager {
                 return@withContext Result.failure(Exception("Unexpected credential type: ${credential.type}"))
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error in Google Sign-In session creation: ${e.message}", e)
-            return@withContext Result.failure(Exception(e.localizedMessage ?: "Authentication failed"))
+            val errorDetail = e.localizedMessage?.takeIf { it.isNotBlank() }
+                ?: e.message?.takeIf { it.isNotBlank() }
+                ?: e::class.java.simpleName
+            Log.e(TAG, "Google Sign-In session failed (${e::class.java.simpleName}): $errorDetail")
+            return@withContext Result.failure(Exception(errorDetail))
         }
     }
 
