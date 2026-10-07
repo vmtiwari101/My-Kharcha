@@ -7,6 +7,8 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.database.AppDatabase
+import com.example.data.dao.SafeDeleteResult
+import com.example.data.dao.SplitOperationResult
 import com.example.data.entity.AccountEntity
 import com.example.data.entity.CardEntity
 import com.example.data.entity.CategoryEntity
@@ -18,6 +20,7 @@ import com.example.utils.EmailParser
 import com.example.utils.EmailParserStatus
 import com.example.utils.SmsParseResult
 import com.example.utils.SmsParser
+import com.example.utils.TransactionIdentityResolver
 import com.example.utils.TransactionIngestionEngine
 import com.example.utils.MerchantLearningEngine
 import com.example.utils.AuthManager
@@ -31,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.gmail.Gmail
+import com.google.firebase.auth.FirebaseAuth
 
 sealed class HistoricalScanState {
     object Idle : HistoricalScanState()
@@ -70,6 +74,10 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     val connectedEmailAddress = MutableStateFlow("Not connected")
     val emailScanStatus = MutableStateFlow("Never scanned")
     private val prefs = application.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
+    private var firebaseAuth: FirebaseAuth? = null
+    private val emailAuthStateListener = FirebaseAuth.AuthStateListener {
+        refreshEmailTrackingPrefs()
+    }
 
     var selectedMonth = MutableStateFlow("2026-09")
 
@@ -95,6 +103,13 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     var lastMainTab = MutableStateFlow("home")
 
     init {
+        try {
+            firebaseAuth = FirebaseAuth.getInstance().also {
+                it.addAuthStateListener(emailAuthStateListener)
+            }
+        } catch (e: Exception) {
+            Log.w("KharchaViewModel", "Firebase authentication listener is unavailable", e)
+        }
         val dao = AppDatabase.getDatabase(application).kharchaDao()
         repository = KharchaRepository(dao)
 
@@ -111,26 +126,54 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         )?.contains(application.packageName) == true
         notificationTrackingEnabled.value = hasNotif
         prefs.edit().putBoolean("notification_tracking_enabled", hasNotif).apply()
-        emailTrackingEnabled.value = prefs.getBoolean("email_tracking_enabled", false)
-        gmailConnected.value = prefs.getBoolean("gmail_connected", false)
-        connectedEmailAddress.value = prefs.getString("gmail_account", "Not connected") ?: "Not connected"
-        emailScanStatus.value = prefs.getString("last_email_scan", "Never scanned") ?: "Never scanned"
+        refreshEmailTrackingPrefs()
 
         prefs.registerOnSharedPreferenceChangeListener { _, key ->
             when (key) {
-                "last_email_scan" -> {
-                    emailScanStatus.value = prefs.getString("last_email_scan", "Never scanned") ?: "Never scanned"
-                }
+                "last_email_scan" -> refreshEmailTrackingPrefs()
                 "email_tracking_enabled" -> {
-                    emailTrackingEnabled.value = prefs.getBoolean("email_tracking_enabled", false)
+                    refreshEmailTrackingPrefs()
                 }
                 "gmail_connected" -> {
-                    gmailConnected.value = prefs.getBoolean("gmail_connected", false)
+                    refreshEmailTrackingPrefs()
                 }
                 "gmail_account" -> {
-                    connectedEmailAddress.value = prefs.getString("gmail_account", "Not connected") ?: "Not connected"
+                    refreshEmailTrackingPrefs()
                 }
+                com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID -> refreshEmailTrackingPrefs()
             }
+        }
+    }
+
+    override fun onCleared() {
+        firebaseAuth?.removeAuthStateListener(emailAuthStateListener)
+        super.onCleared()
+    }
+
+    private fun liveFirebaseUid(): String? =
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+                ?.takeIf { it.isNotBlank() && it != "legacy:unassigned" }
+        } catch (e: Exception) {
+            Log.w("KharchaViewModel", "Firebase authentication is unavailable for email settings", e)
+            null
+        }
+
+    private fun refreshEmailTrackingPrefs() {
+        val ownerUid = liveFirebaseUid()
+        val isBoundToOwner = ownerUid != null &&
+            prefs.getString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, null) == ownerUid
+        emailTrackingEnabled.value = isBoundToOwner && prefs.getBoolean("email_tracking_enabled", false)
+        gmailConnected.value = isBoundToOwner && prefs.getBoolean("gmail_connected", false)
+        connectedEmailAddress.value = if (gmailConnected.value) {
+            prefs.getString("gmail_account", "Not connected") ?: "Not connected"
+        } else {
+            "Not connected"
+        }
+        emailScanStatus.value = if (isBoundToOwner) {
+            prefs.getString("last_email_scan", "Never scanned") ?: "Never scanned"
+        } else {
+            "Never scanned"
         }
 
         transactions = repository.allTransactions.stateIn(
@@ -181,48 +224,196 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun repairIdentityMappingIfNeeded(dao: com.example.data.dao.KharchaDao) {
         try {
-            val accounts = dao.getAllAccountsSync()
-            val transactions = dao.getAllTransactionsSync()
-            
-            val acc2345 = accounts.find { it.last4Digits == "2345" && (it.bankName.contains("Axis", true) || it.name.contains("Axis", true)) }
-            if (acc2345 != null) {
-                val linkedTx = transactions.filter { it.accountId == acc2345.id }
-                val isIdfcEvidence = linkedTx.any { tx -> 
-                    val text = "${tx.note} ${tx.merchant} ${tx.originalReference}".lowercase()
-                    text.contains("idfc") || tx.source.contains("idfc", true)
-                } || linkedTx.isEmpty()
+            val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid
+                ?.takeIf { it.isNotBlank() }
+                ?: return
+            val accounts = dao.getAllAccountsSyncForUser(uid)
+                .filter { it.userId == uid }
+                .toMutableList()
+            val cards = dao.getAllCardsSyncForUser(uid)
+                .filter { it.userId == uid }
+                .toMutableList()
+            val accountIds = accounts.mapTo(mutableSetOf()) { it.id }
+            val cardsById = cards.associateBy { it.id }.toMutableMap()
 
-                if (isIdfcEvidence) {
-                    val repairedAcc = acc2345.copy(
-                        name = "IDFC FIRST Bank Account •••• 2345",
-                        bankName = "IDFC FIRST Bank",
-                        type = "Bank Account",
-                        updatedAt = java.time.Instant.now().toString()
+            dao.getAllTransactionsSyncForUser(uid)
+                .filter { it.userId == uid }
+                .forEach { transaction ->
+                    val linkedCard = transaction.cardId?.let(cardsById::get)
+                    val hasValidIdentity =
+                        transaction.accountId in accountIds &&
+                            (transaction.cardId.isNullOrBlank() ||
+                                (linkedCard != null && linkedCard.accountId == transaction.accountId))
+                    if (hasValidIdentity) return@forEach
+
+                    val rawIdentityText = listOf(
+                        transaction.note,
+                        transaction.originalReference,
+                        transaction.transactionReference,
+                        transaction.paymentMethod,
+                        transaction.source
+                    ).joinToString(" ")
+                    val lowerIdentityText = rawIdentityText.lowercase(java.util.Locale.ENGLISH)
+                    val extractedLast4 = sequenceOf(
+                        transaction.last4Digits,
+                        transaction.last4.orEmpty(),
+                        TransactionIdentityResolver.extractLast4(lowerIdentityText)
+                    ).firstOrNull { value ->
+                        value.length == 4 && value.all(Char::isDigit)
+                    }.orEmpty()
+                    val bankCandidate = TransactionIdentityResolver.extractBankName(
+                        textLower = lowerIdentityText,
+                        address = transaction.source,
+                        last4 = extractedLast4
                     )
-                    dao.insertAccount(repairedAcc)
-                    android.util.Log.d("KharchaRepair", "Safely repaired account 2345 from Axis Bank to IDFC FIRST Bank")
-                }
-            }
+                    val isCardBillPayment =
+                        transaction.transactionType == "CARD_PAYMENT" ||
+                            lowerIdentityText.contains("credit card payment") ||
+                            lowerIdentityText.contains("cc payment")
+                    val isCreditCardEvidence =
+                        !isCardBillPayment &&
+                            (
+                                lowerIdentityText.contains("credit card") ||
+                                    lowerIdentityText.contains("credit-card") ||
+                                    lowerIdentityText.contains("cc ending") ||
+                                    transaction.paymentMethod.equals("Credit Card", ignoreCase = true)
+                                )
+                    val isBankAccountEvidence = Regex(
+                        "\\b(?:bank\\s+)?account\\b|\\ba/c\\b|\\bsavings\\b|\\bcurrent account\\b",
+                        RegexOption.IGNORE_CASE
+                    ).containsMatchIn(lowerIdentityText)
+                    val identityTypeIsClear =
+                        !isCardBillPayment && (isCreditCardEvidence xor isBankAccountEvidence)
+                    val resolution = TransactionIdentityResolver.resolveIdentity(
+                        evidence = TransactionIdentityResolver.IdentityEvidence(
+                            last4 = extractedLast4,
+                            bankNameCandidate = bankCandidate,
+                            cardTypeCandidate = if (isCreditCardEvidence) "Credit Card" else "",
+                            rawText = rawIdentityText,
+                            source = transaction.source
+                        ),
+                        accounts = accounts,
+                        cards = cards
+                    )
+                    val resolvedCard = resolution.cardId?.let(cardsById::get)
+                    val confidentSameOwnerMatch =
+                        resolution.confidence >= 75 &&
+                            resolution.accountId in accountIds &&
+                            (resolution.cardId == null ||
+                                (resolvedCard != null && resolvedCard.accountId == resolution.accountId))
 
-            val card1843 = accounts.find { it.last4Digits == "1843" }
-            if (card1843 == null) {
-                val newAxisCardAcc = AccountEntity(
-                    id = "acc-auto-axis-1843",
-                    name = "Axis Bank Credit Card •••• 1843",
-                    type = "Credit Card",
-                    bankName = "Axis Bank",
-                    last4Digits = "1843",
-                    icon = "credit-card",
-                    colour = "#7C3AED",
-                    isActive = true,
-                    isOwnedByMe = true,
-                    createdAt = java.time.Instant.now().toString(),
-                    updatedAt = java.time.Instant.now().toString()
-                )
-                dao.insertAccount(newAxisCardAcc)
-            }
+                    var repaired = if (confidentSameOwnerMatch) {
+                        transaction.copy(
+                            accountId = resolution.accountId,
+                            cardId = resolution.cardId,
+                            last4Digits = extractedLast4.ifEmpty { transaction.last4Digits },
+                            needsReview = resolution.needsReview
+                        )
+                    } else {
+                        transaction.copy(needsReview = true)
+                    }
+
+                    if (!confidentSameOwnerMatch &&
+                        identityTypeIsClear &&
+                        bankCandidate.isNotBlank() &&
+                        extractedLast4.isNotBlank()
+                    ) {
+                        val matchingAccounts = accounts.filter { account ->
+                            account.last4Digits == extractedLast4 &&
+                                TransactionIdentityResolver.isBankNameMatch(
+                                    account.bankName.ifBlank { account.name },
+                                    bankCandidate
+                                ) &&
+                                if (isCreditCardEvidence) {
+                                    account.type.equals("Credit Card", ignoreCase = true)
+                                } else {
+                                    !account.type.equals("Credit Card", ignoreCase = true)
+                                }
+                        }
+                        val matchingCards = if (isCreditCardEvidence) {
+                            cards.filter { card ->
+                                card.type.equals("Credit Card", ignoreCase = true) &&
+                                card.last4Digits == extractedLast4 &&
+                                    accounts.any { account ->
+                                        account.id == card.accountId &&
+                                            TransactionIdentityResolver.isBankNameMatch(
+                                                account.bankName.ifBlank { account.name },
+                                                bankCandidate
+                                            )
+                                    }
+                            }
+                        } else {
+                            emptyList()
+                        }
+                        val hasUnmatchedSameLast4 =
+                            accounts.any { it.last4Digits == extractedLast4 } ||
+                                cards.any { it.last4Digits == extractedLast4 }
+
+                        val matchingAccountIds = (
+                            matchingAccounts.map { it.id } + matchingCards.map { it.accountId }
+                            ).distinct()
+                        if (matchingAccountIds.size == 1 && matchingCards.size <= 1) {
+                            val matchingAccountId = matchingAccountIds.single()
+                            repaired = transaction.copy(
+                                accountId = matchingAccountId,
+                                cardId = matchingCards.singleOrNull()?.id,
+                                last4Digits = extractedLast4,
+                                needsReview = false
+                            )
+                        } else if (matchingAccountIds.isEmpty() && !hasUnmatchedSameLast4) {
+                            val now = java.time.Instant.now().toString()
+                            val accountId = "acc-auto-${java.util.UUID.randomUUID().toString().take(8)}"
+                            val account = AccountEntity(
+                                id = accountId,
+                                name = if (isCreditCardEvidence) {
+                                    "$bankCandidate Credit Card •••• $extractedLast4"
+                                } else {
+                                    "$bankCandidate Account •••• $extractedLast4"
+                                },
+                                type = if (isCreditCardEvidence) "Credit Card" else "Bank Account",
+                                bankName = bankCandidate,
+                                last4Digits = extractedLast4,
+                                icon = if (isCreditCardEvidence) "credit-card" else "landmark",
+                                isActive = true,
+                                createdAt = now,
+                                updatedAt = now,
+                                userId = uid
+                            )
+                            dao.insertAccount(account)
+                            accounts.add(account)
+                            accountIds.add(accountId)
+                            val newCardId = if (isCreditCardEvidence) {
+                                "card-auto-${java.util.UUID.randomUUID().toString().take(8)}"
+                            } else {
+                                null
+                            }
+                            if (newCardId != null) {
+                                val card = CardEntity(
+                                        id = newCardId,
+                                        accountId = accountId,
+                                        name = "$bankCandidate Credit Card",
+                                        type = "Credit Card",
+                                        last4Digits = extractedLast4,
+                                        createdAt = now,
+                                        updatedAt = now,
+                                        userId = uid
+                                    )
+                                dao.insertCard(card)
+                                cards.add(card)
+                                cardsById[newCardId] = card
+                            }
+                            repaired = transaction.copy(
+                                accountId = accountId,
+                                cardId = newCardId,
+                                last4Digits = extractedLast4,
+                                needsReview = false
+                            )
+                        }
+                    }
+                    if (repaired != transaction) dao.insertTransaction(repaired)
+                }
         } catch (e: Exception) {
-            android.util.Log.e("KharchaRepair", "Error repairing identity mapping", e)
+            android.util.Log.e("KharchaRepair", "Unable to reconcile transaction identities", e)
         }
     }
 
@@ -457,6 +648,14 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
 
     // Email Tracking
     fun setEmailTracking(enabled: Boolean, context: Context? = null) {
+        val ownerUid = liveFirebaseUid()
+        if (ownerUid == null ||
+            prefs.getString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, null) != ownerUid
+        ) {
+            Log.w("KharchaViewModel", "Email tracking change rejected because Gmail settings are not bound to the live user")
+            refreshEmailTrackingPrefs()
+            return
+        }
         emailTrackingEnabled.value = enabled
         prefs.edit().putBoolean("email_tracking_enabled", enabled).apply()
         val ctx = context ?: getApplication<Application>()
@@ -478,11 +677,17 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun connectGmail(account: String, context: Context? = null) {
+        val ownerUid = liveFirebaseUid()
+        if (ownerUid == null || account.isBlank() || account.equals("Not connected", ignoreCase = true)) {
+            Log.w("KharchaViewModel", "Gmail connection rejected because there is no valid live Firebase user or Gmail account")
+            return
+        }
         gmailConnected.value = true
         connectedEmailAddress.value = account
         prefs.edit()
             .putBoolean("gmail_connected", true)
             .putString("gmail_account", account)
+            .putString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, ownerUid)
             .apply()
         val ctx = context ?: getApplication<Application>()
         if (emailTrackingEnabled.value) {
@@ -492,6 +697,14 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun disconnectGmail(context: Context? = null) {
+        val ownerUid = liveFirebaseUid()
+        if (ownerUid == null ||
+            prefs.getString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, null) != ownerUid
+        ) {
+            Log.w("KharchaViewModel", "Gmail disconnect rejected because settings are not bound to the live user")
+            refreshEmailTrackingPrefs()
+            return
+        }
         gmailConnected.value = false
         connectedEmailAddress.value = "Not connected"
         prefs.edit()
@@ -504,6 +717,12 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun updateEmailScanStatus(status: String) {
+        val ownerUid = liveFirebaseUid()
+        if (ownerUid == null ||
+            prefs.getString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, null) != ownerUid
+        ) {
+            return
+        }
         emailScanStatus.value = status
         prefs.edit().putString("last_email_scan", status).apply()
     }
@@ -511,8 +730,15 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
     private val isScanningEmails = AtomicBoolean(false)
 
     fun scanEmailsNow(activity: Activity, onResult: (String) -> Unit) {
-        val email = connectedEmailAddress.value
-        if (email == "Not connected") {
+        val ownerUid = liveFirebaseUid()
+        if (ownerUid == null ||
+            prefs.getString(com.example.worker.EmailTrackingScheduler.PREFS_OWNER_UID, null) != ownerUid ||
+            !prefs.getBoolean("gmail_connected", false)
+        ) {
+            onResult("Gmail is not connected to the authenticated user.")
+            return
+        }
+        val email = prefs.getString("gmail_account", "")?.takeIf { it.isNotBlank() } ?: run {
             onResult("Gmail not connected.")
             return
         }
@@ -525,6 +751,10 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         AuthManager.requestGmailAuthorization(activity, email, { token ->
             viewModelScope.launch(Dispatchers.IO) {
                 try {
+                    if (liveFirebaseUid() != ownerUid) {
+                        onResult("Email scan stopped because the authenticated user changed.")
+                        return@launch
+                    }
                     val nowFmt = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", java.util.Locale.US).format(java.util.Date())
                     val transport = NetHttpTransport()
                     val jsonFactory = com.google.api.client.json.gson.GsonFactory.getDefaultInstance()
@@ -564,7 +794,12 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
 
                     val messages = messagesResponse?.messages ?: emptyList()
                     val dao = AppDatabase.getDatabase(getApplication()).kharchaDao()
-                    val existingTxs = dao.getAllTransactionsSync()
+                    if (liveFirebaseUid() != ownerUid) {
+                        onResult("Email scan stopped because the authenticated user changed.")
+                        return@launch
+                    }
+                    val existingTxs = dao.getAllTransactionsSyncForUser(ownerUid)
+                        .filter { it.userId == ownerUid }
                     val processedRefs = existingTxs.mapNotNull { it.originalReference }.toSet()
 
                     var imported = 0
@@ -573,6 +808,10 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                     var ignored = 0
 
                     for (message in messages) {
+                        if (liveFirebaseUid() != ownerUid) {
+                            onResult("Email scan stopped because the authenticated user changed.")
+                            return@launch
+                        }
                         val expectedRef = "EMAIL-${message.id}"
                         if (processedRefs.contains(expectedRef)) {
                             duplicates++
@@ -610,7 +849,15 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                         if (com.example.utils.CreditCardBillIngestionEngine.isCreditCardBillMessage(fullEmailText)) {
                             val billInfo = com.example.utils.CreditCardBillIngestionEngine.extractBillInfo(body, subject, "EMAIL", message.id, internalDate)
                             if (billInfo != null) {
-                                val result = com.example.utils.CreditCardBillIngestionEngine.ingestBillInfo(getApplication(), billInfo)
+                                if (liveFirebaseUid() != ownerUid) {
+                                    onResult("Email scan stopped because the authenticated user changed.")
+                                    return@launch
+                                }
+                                val result = com.example.utils.CreditCardBillIngestionEngine.ingestBillInfo(
+                                    getApplication(),
+                                    billInfo,
+                                    expectedOwnerUid = ownerUid
+                                )
                                 when (result) {
                                     is com.example.utils.BillIngestionResult.Updated -> imported++
                                     is com.example.utils.BillIngestionResult.Duplicate -> duplicates++
@@ -625,8 +872,15 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                         val parseResult = EmailParser.parseEmail(message.id, subject, body, internalDate, existingTxs)
 
                         if (parseResult.transaction != null) {
+                            if (liveFirebaseUid() != ownerUid) {
+                                onResult("Email scan stopped because the authenticated user changed.")
+                                return@launch
+                            }
                             val ingestionResult = TransactionIngestionEngine.ingestTransaction(
-                                getApplication(), parseResult.transaction, "$subject $body"
+                                getApplication(),
+                                parseResult.transaction.copy(userId = ownerUid),
+                                "$subject $body",
+                                expectedOwnerUid = ownerUid
                             )
                             when (ingestionResult.second) {
                                 com.example.utils.IngestionStatus.IMPORTED -> imported++
@@ -640,7 +894,7 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
                     }
 
                     val status = "Last scanned: $nowFmt ($imported imported)"
-                    updateEmailScanStatus(status)
+                    if (liveFirebaseUid() == ownerUid) updateEmailScanStatus(status)
                     onResult("Scan complete: $imported imported, $duplicates duplicates, $ignored ignored.")
 
                 } catch (e: Exception) {
@@ -836,15 +1090,42 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun saveTransactionSplits(transactionId: String, splits: List<TransactionSplitEntity>) {
+    fun saveTransactionSplits(
+        transactionId: String,
+        splits: List<TransactionSplitEntity>,
+        callback: (SplitOperationResult) -> Unit = {}
+    ) {
         viewModelScope.launch {
-            repository.insertSplitsForTransaction(transactionId, splits)
+            callback(repository.insertSplitsForTransaction(transactionId, splits))
         }
     }
 
-    fun removeTransactionSplits(transactionId: String) {
+    fun updateTransactionWithSplits(
+        transaction: TransactionEntity,
+        splits: List<TransactionSplitEntity>,
+        callback: (SplitOperationResult) -> Unit = {}
+    ) {
         viewModelScope.launch {
-            repository.deleteSplitsForTransaction(transactionId)
+            callback(repository.updateTransactionWithSplits(transaction, splits))
+        }
+    }
+
+    fun createTransactionWithSplits(
+        transaction: TransactionEntity,
+        splits: List<TransactionSplitEntity>,
+        callback: (SplitOperationResult) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            callback(repository.saveTransactionWithSplits(transaction, splits))
+        }
+    }
+
+    fun removeTransactionSplits(
+        transactionId: String,
+        callback: (SplitOperationResult) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            callback(repository.deleteSplitsForTransaction(transactionId))
         }
     }
 
@@ -952,10 +1233,13 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun deleteCategory(id: String) {
-        val now = getNowIsoString()
+    fun checkCategoryDeleteStatus(
+        id: String,
+        expectedOwner: String,
+        callback: (SafeDeleteResult) -> Unit
+    ) {
         viewModelScope.launch {
-            repository.deleteCategory(id, now)
+            callback(repository.checkCategoryDeleteStatus(id, expectedOwner))
         }
     }
 
@@ -974,15 +1258,32 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun safeDeleteCategory(categoryId: String, onHasTransactions: (Int) -> Unit, onSuccess: () -> Unit) {
+    fun deleteCategory(
+        id: String,
+        expectedOwner: String,
+        callback: (SafeDeleteResult) -> Unit
+    ) {
         viewModelScope.launch {
-            val count = repository.getTransactionCountForCategory(categoryId)
-            if (count > 0) {
-                onHasTransactions(count)
-            } else {
-                val now = getNowIsoString()
-                repository.deleteCategory(categoryId, now)
-                onSuccess()
+            callback(repository.deleteCategory(id, expectedOwner))
+        }
+    }
+
+    fun safeDeleteCategory(
+        categoryId: String,
+        onHasTransactions: (Int) -> Unit,
+        onSuccess: () -> Unit
+    ) {
+        viewModelScope.launch {
+            val owner = try {
+                FirebaseAuth.getInstance().currentUser?.uid
+            } catch (e: IllegalStateException) {
+                Log.w("KharchaViewModel", "Category deletion is unavailable without Firebase authentication", e)
+                null
+            } ?: return@launch
+            when (repository.deleteCategory(categoryId, owner)) {
+                SafeDeleteResult.DELETED -> onSuccess()
+                SafeDeleteResult.IN_USE -> onHasTransactions(1)
+                else -> Unit
             }
         }
     }
@@ -1031,17 +1332,30 @@ class KharchaViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun moveSubcategory(subcategoryId: String, newCategoryId: String, moveTransactions: Boolean = true) {
+    fun moveSubcategory(subcategoryId: String, newCategoryId: String, moveTransactions: Boolean = false) {
         val now = getNowIsoString()
         viewModelScope.launch {
             repository.moveSubcategory(subcategoryId, newCategoryId, now, moveTransactions)
         }
     }
 
-    fun deleteSubcategory(id: String) {
-        val now = getNowIsoString()
+    fun checkSubcategoryDeleteStatus(
+        id: String,
+        expectedOwner: String,
+        callback: (SafeDeleteResult) -> Unit
+    ) {
         viewModelScope.launch {
-            repository.deleteSubcategory(id, now)
+            callback(repository.checkSubcategoryDeleteStatus(id, expectedOwner))
+        }
+    }
+
+    fun deleteSubcategory(
+        id: String,
+        expectedOwner: String,
+        callback: (SafeDeleteResult) -> Unit
+    ) {
+        viewModelScope.launch {
+            callback(repository.deleteSubcategory(id, expectedOwner))
         }
     }
 

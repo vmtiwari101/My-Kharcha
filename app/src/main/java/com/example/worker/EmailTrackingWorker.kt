@@ -25,7 +25,20 @@ class EmailTrackingWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         Log.d(TAG, "EmailTrackingWorker triggered by WorkManager.")
         try {
-            val result = EmailSyncEngine.syncEmails(applicationContext, isBackground = true)
+            val scheduledOwnerUid = inputData.getString(EmailTrackingScheduler.INPUT_OWNER_UID)
+                ?.takeIf { it.isNotBlank() }
+                ?: return@withContext Result.success()
+            val liveUid = EmailSyncEngine.liveAuthenticatedUid()
+                ?: return@withContext Result.success()
+            if (scheduledOwnerUid != liveUid) {
+                Log.w(TAG, "Stale email work rejected because its owner does not match the live user")
+                return@withContext Result.success()
+            }
+            val result = EmailSyncEngine.syncEmails(
+                applicationContext,
+                isBackground = true,
+                expectedOwnerUid = scheduledOwnerUid
+            )
             when (result) {
                 is SyncResult.Success -> {
                     Log.d(TAG, "Email tracking sync completed successfully.")

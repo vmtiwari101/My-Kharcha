@@ -8,6 +8,7 @@ package com.example.data.firestore
  *   users/{uid}/accounts/{accountId}
  *   users/{uid}/cards/{cardId}
  *   users/{uid}/transactions/{transactionId}
+ *   users/{uid}/transaction_splits/{splitId}
  *   users/{uid}/categories/{categoryId}
  *   users/{uid}/subcategories/{subcategoryId}
  *   users/{uid}/merchants/{merchantId}
@@ -32,6 +33,10 @@ object FirestorePaths {
     fun transactionsCollectionPath(uid: String): String = "users/$uid/transactions"
 
     fun transactionDocumentPath(uid: String, transactionId: String): String = "users/$uid/transactions/$transactionId"
+
+    fun transactionSplitsCollectionPath(uid: String): String = "users/$uid/transaction_splits"
+
+    fun transactionSplitDocumentPath(uid: String, splitId: String): String = "users/$uid/transaction_splits/$splitId"
 
     fun categoriesCollectionPath(uid: String): String = "users/$uid/categories"
 

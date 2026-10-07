@@ -52,9 +52,10 @@ class FirestoreRestorePhase4Test {
             type = "Savings",
             bankName = "HDFC Bank",
             last4Digits = "9988",
-            initialBalance = 25000.0
+            initialBalance = 25000.0,
+            userId = "uid_test"
         )
-        val accMap = originalAccount.toFirestoreMap()
+        val accMap = originalAccount.toFirestoreMap("uid_test")
         val restoredAcc = accMap.toAccountEntity("acc_restore_1")
 
         assertEquals(originalAccount.id, restoredAcc.id)
@@ -68,9 +69,10 @@ class FirestoreRestorePhase4Test {
             name = "HDFC Millennia",
             type = "Credit Card",
             last4Digits = "1234",
-            creditLimit = 100000.0
+            creditLimit = 100000.0,
+            userId = "uid_test"
         )
-        val cardMap = originalCard.toFirestoreMap()
+        val cardMap = originalCard.toFirestoreMap("uid_test")
         val restoredCard = cardMap.toCardEntity("card_restore_1")
 
         assertEquals(originalCard.id, restoredCard.id)
@@ -88,9 +90,10 @@ class FirestoreRestorePhase4Test {
             colour = "#EC4899",
             isIncome = false,
             createdAt = "2026-09-29T00:00:00Z",
-            updatedAt = "2026-09-29T00:00:00Z"
+            updatedAt = "2026-09-29T00:00:00Z",
+            userId = "uid_test"
         )
-        val catMap = originalCat.toFirestoreMap()
+        val catMap = originalCat.toFirestoreMap("uid_test")
         val restoredCat = catMap.toCategoryEntity("cat_restore_shopping")
 
         assertEquals("cat_restore_shopping", restoredCat.id)
@@ -107,9 +110,10 @@ class FirestoreRestorePhase4Test {
             icon = "👕",
             colour = "#EC4899",
             createdAt = "2026-09-29T00:00:00Z",
-            updatedAt = "2026-09-29T00:00:00Z"
+            updatedAt = "2026-09-29T00:00:00Z",
+            userId = "uid_test"
         )
-        val subMap = originalSub.toFirestoreMap()
+        val subMap = originalSub.toFirestoreMap("uid_test")
         val restoredSub = subMap.toSubcategoryEntity("sub_restore_clothes")
 
         assertEquals("sub_restore_clothes", restoredSub.id)
@@ -138,9 +142,10 @@ class FirestoreRestorePhase4Test {
             createdAt = "2026-09-29T15:00:00Z",
             updatedAt = "2026-09-29T15:00:00Z",
             direction = "DEBIT",
-            isExpense = true
+            isExpense = true,
+            userId = "uid_test"
         )
-        val expMap = expenseTx.toFirestoreMap()
+        val expMap = expenseTx.toFirestoreMap("uid_test")
         val restoredExp = expMap.toTransactionEntity("tx_exp_restored")
 
         assertEquals("tx_exp_restored", restoredExp.id)
@@ -168,9 +173,10 @@ class FirestoreRestorePhase4Test {
             createdAt = "2026-09-29T10:00:00Z",
             updatedAt = "2026-09-29T10:00:00Z",
             direction = "CREDIT",
-            isExpense = false
+            isExpense = false,
+            userId = "uid_test"
         )
-        val incMap = incomeTx.toFirestoreMap()
+        val incMap = incomeTx.toFirestoreMap("uid_test")
         val restoredInc = incMap.toTransactionEntity("tx_inc_restored")
 
         assertEquals("tx_inc_restored", restoredInc.id)
@@ -199,13 +205,14 @@ class FirestoreRestorePhase4Test {
             last4Digits = "",
             createdAt = "",
             updatedAt = "",
-            isExpense = true
+            isExpense = true,
+            userId = "uid_test"
         )
 
-        val map1 = tx.toFirestoreMap()
+        val map1 = tx.toFirestoreMap("uid_test")
         val restoredFirst = map1.toTransactionEntity("tx_idempotent_100")
 
-        val map2 = tx.toFirestoreMap()
+        val map2 = tx.toFirestoreMap("uid_test")
         val restoredSecond = map2.toTransactionEntity("tx_idempotent_100")
 
         assertEquals(restoredFirst.id, restoredSecond.id)

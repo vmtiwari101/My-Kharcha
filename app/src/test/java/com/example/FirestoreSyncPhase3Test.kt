@@ -49,14 +49,15 @@ class FirestoreSyncPhase3Test {
             last4Digits = "4321",
             createdAt = "2026-09-29T10:00:00Z",
             updatedAt = "2026-09-29T10:00:00Z",
-            isExpense = true
+            isExpense = true,
+            userId = "uid_test"
         )
 
-        val map1 = tx.toFirestoreMap()
+        val map1 = tx.toFirestoreMap("uid_test")
         val path1 = FirestorePaths.transactionDocumentPath("uid_test", tx.id)
 
         val reSyncedTx = tx.copy(amount = 1250.0, updatedAt = "2026-09-29T10:05:00Z")
-        val map2 = reSyncedTx.toFirestoreMap()
+        val map2 = reSyncedTx.toFirestoreMap("uid_test")
         val path2 = FirestorePaths.transactionDocumentPath("uid_test", reSyncedTx.id)
 
         // Document ID remains identical for same local record ID
@@ -86,10 +87,11 @@ class FirestoreSyncPhase3Test {
             last4Digits = "",
             createdAt = "",
             updatedAt = "",
-            isExpense = true
+            isExpense = true,
+            userId = "uid_test"
         )
 
-        val map = expenseTx.toFirestoreMap()
+        val map = expenseTx.toFirestoreMap("uid_test")
         assertEquals(true, map["isExpense"])
         assertEquals("EXPENSE", map["type"])
 
@@ -119,10 +121,11 @@ class FirestoreSyncPhase3Test {
             createdAt = "",
             updatedAt = "",
             direction = "CREDIT",
-            isExpense = false
+            isExpense = false,
+            userId = "uid_test"
         )
 
-        val map = incomeTx.toFirestoreMap()
+        val map = incomeTx.toFirestoreMap("uid_test")
         assertEquals("INCOME", map["type"])
         assertEquals("CREDIT", map["direction"])
         assertEquals(false, map["isExpense"])

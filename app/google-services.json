@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "884104898509",
+    "project_id": "my-kharcha-cdb0c",
+    "storage_bucket": "my-kharcha-cdb0c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:884104898509:android:b43a81712a5d410a404684",
+        "android_client_info": {
+          "package_name": "com.aistudio.mykharcha.xkmpzq"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "884104898509-okvms5eei338f0k7l40krd256laji470.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.aistudio.mykharcha.xkmpzq",
+            "certificate_hash": "fd07287a430597f9b9365a47b38c91cd08f6435f"
+          }
+        },
+        {
+          "client_id": "884104898509-ica2ci4k6fij86qm58l9mds6mb9po81f.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAerZgHk551FxkZmhDtHvENyhU3_JoXlbM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "884104898509-ica2ci4k6fij86qm58l9mds6mb9po81f.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

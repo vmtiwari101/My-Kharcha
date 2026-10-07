@@ -52,43 +52,21 @@ data class UnifiedCreditCard(
 
 // Credit Card Transaction helpers for accurate outstanding calculation
 private fun isCreditCardPurchase(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
-    val isDebit = (tx.direction == "DEBIT" || tx.type == "EXPENSE") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER" && tx.transactionType != "CARD_PAYMENT" && tx.transactionType != "CREDIT_CARD_BILL_PAYMENT"
-    if (!isDebit) return false
-
-    if (cardId != null && tx.cardId == cardId) return true
-    if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-    if (last4.length == 4 && tx.last4Digits == last4) {
-        val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
-        return text.contains("credit card") || text.contains("credit-card") || text.contains("cc ending") || text.contains("card ending") || tx.paymentMethod.contains("card", true)
-    }
-    return false
+    return com.example.utils.TransactionIdentityResolver.isCreditCardPurchase(
+        tx,
+        cardId,
+        accountId,
+        last4
+    )
 }
 
 private fun isCreditCardPaymentOrRefund(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
-    // 1. Credit Card Bill Payment specifically directed to this credit card
-    val isPaymentIdentifier = tx.transactionType == "CARD_PAYMENT" || tx.transactionType == "CREDIT_CARD_BILL_PAYMENT" || tx.merchant.contains("Credit Card Bill Payment", true) ||
-            tx.note.contains("credit card payment", true) || tx.note.contains("cc payment", true) ||
-            tx.note.contains("payment received towards your credit card", true) || tx.note.contains("paid towards credit card", true)
-
-    if (isPaymentIdentifier) {
-        if (accountId.isNotEmpty() && tx.counterpartyAccountId == accountId) return true
-        if (cardId != null && tx.counterpartyAccountId == cardId) return true
-        if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-        if (last4.length == 4 && tx.last4Digits == last4) return true
-    }
-
-    // 2. Direct credit/refund/cashback credited specifically to this credit card (not general bank income)
-    val isCredit = (tx.direction == "CREDIT" || tx.type == "INCOME") && !tx.isInternalTransfer && tx.transactionType != "INTERNAL_TRANSFER" && tx.transactionType != "CREDIT_CARD_BILL_PAYMENT"
-    if (isCredit) {
-        if (cardId != null && tx.cardId == cardId) return true
-        if (accountId.isNotEmpty() && tx.accountId == accountId) return true
-        if (last4.length == 4 && tx.last4Digits == last4) {
-            val text = "${tx.note} ${tx.paymentMethod} ${tx.merchant}".lowercase(Locale.ENGLISH)
-            return text.contains("refund") || text.contains("cashback") || text.contains("reversal") || text.contains("credit card")
-        }
-    }
-
-    return false
+    return com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+        tx,
+        cardId,
+        accountId,
+        last4
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -169,9 +147,25 @@ fun AllCreditCardsScreen(
 
             val expenseTotal = linkedTxs.filter { isCreditCardPurchase(it, card.id, effectiveAccId, last4) }.sumOf { it.amount }
             val paymentTotal = linkedTxs.filter { isCreditCardPaymentOrRefund(it, card.id, effectiveAccId, last4) }.sumOf { it.amount }
-            val txCalculatedOutstanding = Math.max(0.0, expenseTotal - paymentTotal)
             val storedOutstanding = maxOf(parentAcc?.outstandingAmount ?: 0.0, card.outstandingAmount)
-            val effectiveOutstanding = if (txCalculatedOutstanding > 0.0) txCalculatedOutstanding else storedOutstanding
+            val hasBalanceActivity = expenseTotal > 0.0 || paymentTotal > 0.0
+            val effectiveOutstanding = if (parentAcc?.type.equals("Credit Card", ignoreCase = true)) {
+                if (hasBalanceActivity || parentAcc.initialBalance != 0.0) {
+                    com.example.utils.TransactionIdentityResolver.creditCardOutstandingFromAnchor(
+                        parentAcc.initialBalance,
+                        linkedTxs,
+                        card.id,
+                        effectiveAccId,
+                        last4
+                    )
+                } else {
+                    storedOutstanding
+                }
+            } else if (hasBalanceActivity) {
+                Math.max(0.0, expenseTotal - paymentTotal)
+            } else {
+                storedOutstanding
+            }
 
             val effectiveLimit = maxOf(parentAcc?.creditLimit ?: 0.0, card.creditLimit)
             val billing = if (card.billingDate > 0) card.billingDate else (parentAcc?.billingDate ?: 0)
@@ -242,8 +236,18 @@ fun AllCreditCardsScreen(
 
             val expenseTotal = linkedTxs.filter { isCreditCardPurchase(it, null, acc.id, last4) }.sumOf { it.amount }
             val paymentTotal = linkedTxs.filter { isCreditCardPaymentOrRefund(it, null, acc.id, last4) }.sumOf { it.amount }
-            val txCalculatedOutstanding = Math.max(0.0, expenseTotal - paymentTotal)
-            val effectiveOutstanding = if (txCalculatedOutstanding > 0.0) txCalculatedOutstanding else acc.outstandingAmount
+            val hasBalanceActivity = expenseTotal > 0.0 || paymentTotal > 0.0
+            val effectiveOutstanding = if (hasBalanceActivity || acc.initialBalance != 0.0) {
+                com.example.utils.TransactionIdentityResolver.creditCardOutstandingFromAnchor(
+                    acc.initialBalance,
+                    linkedTxs,
+                    null,
+                    acc.id,
+                    last4
+                )
+            } else {
+                acc.outstandingAmount
+            }
 
             list.add(
                 UnifiedCreditCard(

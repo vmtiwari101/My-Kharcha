@@ -3,27 +3,28 @@ package com.example.data.entity
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
-import androidx.room.PrimaryKey
 
 @Entity(
     tableName = "transaction_splits",
+    primaryKeys = ["userId", "id"],
     foreignKeys = [
         ForeignKey(
             entity = TransactionEntity::class,
-            parentColumns = ["id"],
-            childColumns = ["transactionId"],
+            parentColumns = ["userId", "id"],
+            childColumns = ["userId", "transactionId"],
             onDelete = ForeignKey.CASCADE
         )
     ],
-    indices = [Index("transactionId")]
+    indices = [Index(value = ["userId", "transactionId"])]
 )
 data class TransactionSplitEntity(
-    @PrimaryKey val id: String,
+    val id: String,
     val transactionId: String,
     val categoryId: String,
     val subcategoryId: String = "",
     val amount: Double,
     val note: String = "",
     val createdAt: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val userId: String = ""
 )

@@ -12,6 +12,8 @@ import com.example.utils.NotificationParser
 import com.example.utils.NotificationStatus
 import com.example.utils.TransactionIngestionEngine
 import com.example.utils.IngestionStatus
+import com.example.utils.CreditCardBillIngestionEngine
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,13 +28,36 @@ class KharchaNotificationListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "KharchaNotifService"
+        private const val LEGACY_OWNER = "legacy:unassigned"
+        private const val PREFS_NAME = "kharcha_prefs"
+        private const val TRACKING_ENABLED_KEY = "notification_tracking_enabled"
         var activeInstance: KharchaNotificationListenerService? = null
             private set
+
+        @Volatile
+        internal var liveAuthenticatedUidProvider: () -> String? = {
+            try {
+                FirebaseAuth.getInstance().currentUser?.uid
+            } catch (e: Exception) {
+                Log.w(TAG, "Firebase authentication is unavailable", e)
+                null
+            }
+        }
+
+        private fun liveOwner(): String? =
+            liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+        private fun isTrackingEnabled(context: Context): Boolean =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(TRACKING_ENABLED_KEY, false)
 
         suspend fun scanActiveNotifications(context: Context): Pair<Int, Int> = withContext(Dispatchers.IO) {
             val service = activeInstance
             if (service == null) {
                 Log.d(TAG, "Notification listener service not active currently.")
+                return@withContext Pair(0, 0)
+            }
+            if (!isTrackingEnabled(context) || liveOwner() == null) {
                 return@withContext Pair(0, 0)
             }
             return@withContext service.processActiveNotifications(context)
@@ -61,35 +86,58 @@ class KharchaNotificationListenerService : NotificationListenerService() {
         super.onNotificationPosted(sbn)
         if (sbn == null) return
 
-        val prefs = applicationContext.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
-        val trackingEnabled = prefs.getBoolean("notification_tracking_enabled", false)
-        if (!trackingEnabled) return
+        if (!isTrackingEnabled(applicationContext)) return
+        val owner = liveOwner() ?: return
 
-        processSingleNotification(sbn, applicationContext)
+        processSingleNotification(sbn, applicationContext, owner)
     }
 
     suspend fun processActiveNotifications(context: Context): Pair<Int, Int> = withContext(Dispatchers.IO) {
+        if (!isTrackingEnabled(context)) return@withContext Pair(0, 0)
+        val owner = liveOwner() ?: return@withContext Pair(0, 0)
+        try {
+            if (liveOwner() != owner) return@withContext Pair(0, 0)
+            val activeNotifs = getActiveNotifications() ?: emptyArray()
+            processActiveNotificationBatch(context, activeNotifs, owner)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error retrieving active notifications: ${e.message}", e)
+            Pair(0, 0)
+        }
+    }
+
+    internal suspend fun processActiveNotificationBatch(
+        context: Context,
+        activeNotifs: Array<StatusBarNotification>,
+        expectedOwnerUid: String
+    ): Pair<Int, Int> = withContext(Dispatchers.IO) {
+        if (!isTrackingEnabled(context) || liveOwner() != expectedOwnerUid) {
+            return@withContext Pair(0, 0)
+        }
         var importedCount = 0
         var duplicatesCount = 0
 
         try {
-            val activeNotifs = getActiveNotifications() ?: emptyArray()
             Log.d(TAG, "Scanning ${activeNotifs.size} active notifications in system tray")
 
             for (sbn in activeNotifs) {
-                val (imported, duplicate) = processSingleNotificationSync(sbn, context)
+                if (liveOwner() != expectedOwnerUid) {
+                    return@withContext Pair(importedCount, duplicatesCount)
+                }
+                val (imported, duplicate) = processSingleNotificationSync(sbn, context, expectedOwnerUid)
                 importedCount += imported
                 duplicatesCount += duplicate
             }
 
-            val prefs = context.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
-            val nowFmt = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.US).format(java.util.Date())
-            val status = "Last scanned: $nowFmt ($importedCount imported)"
-            prefs.edit()
-                .putString("last_notif_scan", status)
-                .putInt("notif_imported_count", prefs.getInt("notif_imported_count", 0) + importedCount)
-                .putInt("notif_duplicate_count", prefs.getInt("notif_duplicate_count", 0) + duplicatesCount)
-                .apply()
+            if (liveOwner() == expectedOwnerUid && isTrackingEnabled(context)) {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val nowFmt = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.US).format(java.util.Date())
+                val status = "Last scanned: $nowFmt ($importedCount imported)"
+                prefs.edit()
+                    .putString("last_notif_scan", status)
+                    .putInt("notif_imported_count", prefs.getInt("notif_imported_count", 0) + importedCount)
+                    .putInt("notif_duplicate_count", prefs.getInt("notif_duplicate_count", 0) + duplicatesCount)
+                    .apply()
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "Error scanning active notifications: ${e.message}", e)
@@ -98,26 +146,54 @@ class KharchaNotificationListenerService : NotificationListenerService() {
         return@withContext Pair(importedCount, duplicatesCount)
     }
 
-    private fun processSingleNotification(sbn: StatusBarNotification, context: Context) {
+    private fun processSingleNotification(sbn: StatusBarNotification, context: Context, expectedOwnerUid: String) {
         serviceScope.launch {
-            processSingleNotificationSync(sbn, context)
+            processSingleNotificationSync(sbn, context, expectedOwnerUid)
         }
     }
 
-    private suspend fun processSingleNotificationSync(sbn: StatusBarNotification, context: Context): Pair<Int, Int> {
+    internal suspend fun processSingleNotificationSync(
+        sbn: StatusBarNotification,
+        context: Context,
+        expectedOwnerUid: String
+    ): Pair<Int, Int> {
+        if (!isTrackingEnabled(context) || liveOwner() != expectedOwnerUid) {
+            return Pair(0, 0)
+        }
+        val extras = sbn.notification.extras
+        return processNotificationContent(
+            packageName = sbn.packageName ?: "",
+            title = extras.getCharSequence("android.title")?.toString() ?: "",
+            text = extras.getCharSequence("android.text")?.toString() ?: "",
+            bigText = extras.getCharSequence("android.bigText")?.toString() ?: "",
+            subText = extras.getCharSequence("android.subText")?.toString() ?: "",
+            textLines = extras.getCharSequenceArray("android.textLines")?.joinToString(" ") ?: "",
+            postTime = sbn.postTime,
+            context = context,
+            expectedOwnerUid = expectedOwnerUid
+        )
+    }
+
+    internal suspend fun processNotificationContent(
+        packageName: String,
+        title: String,
+        text: String,
+        bigText: String,
+        subText: String,
+        textLines: String,
+        postTime: Long,
+        context: Context,
+        expectedOwnerUid: String
+    ): Pair<Int, Int> {
+        val owner = liveOwner()
+        if (!isTrackingEnabled(context) || owner == null || owner != expectedOwnerUid) {
+            return Pair(0, 0)
+        }
         val startTime = System.currentTimeMillis()
         var imported = 0
         var duplicates = 0
 
         try {
-            val packageName = sbn.packageName ?: ""
-            val extras = sbn.notification.extras
-            val title = extras.getCharSequence("android.title")?.toString() ?: ""
-            val text = extras.getCharSequence("android.text")?.toString() ?: ""
-            val bigText = extras.getCharSequence("android.bigText")?.toString() ?: ""
-            val subText = extras.getCharSequence("android.subText")?.toString() ?: ""
-            val textLines = extras.getCharSequenceArray("android.textLines")?.joinToString(" ") ?: ""
-
             val combinedContent = "$title $text $bigText $subText $textLines".lowercase(Locale.ENGLISH)
             Log.d("KharchaNotifService", "[STAGE 1: Notification Received] Package: $packageName, Time: ${System.currentTimeMillis()}, Content length: ${combinedContent.length}")
 
@@ -136,19 +212,22 @@ class KharchaNotificationListenerService : NotificationListenerService() {
                 return Pair(0, 0)
             }
 
-            val postTime = sbn.postTime
             val parseStart = System.currentTimeMillis()
 
-            if (com.example.utils.CreditCardBillIngestionEngine.isCreditCardBillMessage(combinedContent)) {
-                val billInfo = com.example.utils.CreditCardBillIngestionEngine.extractBillInfo(combinedContent, packageName, "NOTIFICATION", "notif-$postTime", postTime)
+            if (CreditCardBillIngestionEngine.isCreditCardBillMessage(combinedContent)) {
+                val billInfo = CreditCardBillIngestionEngine.extractBillInfo(combinedContent, packageName, "NOTIFICATION", "notif-$postTime", postTime)
                 if (billInfo != null) {
-                    com.example.utils.CreditCardBillIngestionEngine.ingestBillInfo(context, billInfo)
+                    if (liveOwner() == owner) {
+                        CreditCardBillIngestionEngine.ingestBillInfo(context, billInfo, expectedOwnerUid = owner)
+                    }
                 }
                 return Pair(0, 0)
             }
 
             val dao = AppDatabase.getDatabase(context).kharchaDao()
-            val existing = dao.getAllTransactionsSync()
+            if (liveOwner() != owner) return Pair(0, 0)
+            val existing = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
+            if (liveOwner() != owner) return Pair(0, 0)
 
             Log.d("KharchaNotifService", "[STAGE 2: Parsing Start] Time: $parseStart, Existing transactions size: ${existing.size}")
             val result = NotificationParser.parseNotification(
@@ -164,11 +243,12 @@ class KharchaNotificationListenerService : NotificationListenerService() {
             Log.d("KharchaNotifService", "[STAGE 2: Parsing End] Result status: ${result.status}, Time taken: ${parseEnd - parseStart} ms")
 
             if (result.status == NotificationStatus.IMPORTED && result.transaction != null) {
+                if (liveOwner() != owner) return Pair(0, 0)
                 val ingestStart = System.currentTimeMillis()
                 Log.d("KharchaNotifService", "[STAGE 3: Ingestion Engine Start] Time: $ingestStart")
                 val (ingested, status) = TransactionIngestionEngine.ingestTransaction(
                     context = context,
-                    rawTx = result.transaction,
+                    rawTx = result.transaction.copy(userId = owner),
                     rawText = combinedContent
                 )
                 val ingestEnd = System.currentTimeMillis()

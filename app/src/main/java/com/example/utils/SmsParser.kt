@@ -5,8 +5,10 @@ import android.net.Uri
 import android.util.Log
 import com.example.data.database.AppDatabase
 import com.example.data.entity.TransactionEntity
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
 
@@ -23,6 +25,30 @@ data class SmsParseResult(
 object SmsParser {
 
     private const val TAG = "SmsParser"
+    private const val LEGACY_OWNER = "legacy:unassigned"
+
+    @Volatile
+    internal var liveAuthenticatedUidProvider: () -> String? = {
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase authentication is unavailable", e)
+            null
+        }
+    }
+
+    internal fun liveAuthenticatedUid(): String? =
+        liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+    private fun emptyParseResult() = SmsParseResult(
+        transactions = emptyList(),
+        importedCount = 0,
+        updatedCount = 0,
+        skippedDuplicatesCount = 0,
+        ignoredCount = 0,
+        needsReviewCount = 0,
+        parsingFailedCount = 0
+    )
 
     data class RawSms(
         val id: String,
@@ -38,6 +64,19 @@ object SmsParser {
         olderThanTimestamp: Long = 0,
         onProgress: ((scannedCount: Int, totalFound: Int, importedCount: Int, duplicatesCount: Int) -> Unit)? = null
     ): SmsParseResult = withContext(Dispatchers.IO) {
+        val owner = liveAuthenticatedUid() ?: return@withContext emptyParseResult()
+        processSmsListForOwner(context, smsList, newerThanTimestamp, olderThanTimestamp, owner, onProgress)
+    }
+
+    private suspend fun processSmsListForOwner(
+        context: Context,
+        smsList: List<RawSms>,
+        newerThanTimestamp: Long,
+        olderThanTimestamp: Long,
+        owner: String,
+        onProgress: ((scannedCount: Int, totalFound: Int, importedCount: Int, duplicatesCount: Int) -> Unit)?
+    ): SmsParseResult = withContext(Dispatchers.IO) {
+        if (liveAuthenticatedUid() != owner) return@withContext emptyParseResult()
         val parsedList = mutableListOf<TransactionEntity>()
         var ignored = 0
         var updated = 0
@@ -57,13 +96,16 @@ object SmsParser {
         Log.d(TAG, "SMS Scan Start: Total filtered SMS to process = $totalFound")
         
         val db = AppDatabase.getDatabase(context)
-        val initialRoomCount = db.kharchaDao().getAllTransactionsSync().size
+        if (liveAuthenticatedUid() != owner) return@withContext emptyParseResult()
+        val initialRoomCount = db.kharchaDao().getAllTransactionsSyncForUser(owner)
+            .count { it.userId == owner }
         Log.d(TAG, "Room count before SMS scan: $initialRoomCount")
 
         onProgress?.invoke(0, totalFound, 0, 0)
         var scanned = 0
 
         for (sms in filteredList) {
+            if (liveAuthenticatedUid() != owner) break
             scanned++
 
             // Check if message is a Credit Card Bill / Statement message
@@ -71,7 +113,12 @@ object SmsParser {
             if (CreditCardBillIngestionEngine.isCreditCardBillMessage(combinedBody)) {
                 val billInfo = CreditCardBillIngestionEngine.extractBillInfo(sms.body, sms.address, "SMS", sms.id, sms.timestamp)
                 if (billInfo != null) {
-                    val result = CreditCardBillIngestionEngine.ingestBillInfo(context, billInfo)
+                    if (liveAuthenticatedUid() != owner) break
+                    val result = CreditCardBillIngestionEngine.ingestBillInfo(
+                        context,
+                        billInfo,
+                        expectedOwnerUid = owner
+                    )
                     when (result) {
                         is BillIngestionResult.Updated -> updated++
                         is BillIngestionResult.Duplicate -> duplicates++
@@ -96,10 +143,12 @@ object SmsParser {
                     val rawText = "${sms.address} ${tx.merchant} ${tx.note} ${tx.last4Digits} ${sms.body}"
 
                     // Ingest directly via the centralized TransactionIngestionEngine
+                    if (liveAuthenticatedUid() != owner) break
                     val (ingestedTx, status) = TransactionIngestionEngine.ingestTransaction(
                         context = context,
-                        rawTx = tx,
-                        rawText = rawText
+                        rawTx = tx.copy(userId = owner),
+                        rawText = rawText,
+                        expectedOwnerUid = owner
                     )
 
                     when (status) {
@@ -133,7 +182,19 @@ object SmsParser {
             }
         }
 
-        val finalRoomCount = db.kharchaDao().getAllTransactionsSync().size
+        if (liveAuthenticatedUid() != owner) {
+            return@withContext SmsParseResult(
+                transactions = parsedList,
+                importedCount = imported,
+                updatedCount = updated,
+                skippedDuplicatesCount = duplicates,
+                ignoredCount = ignored,
+                needsReviewCount = needsReview,
+                parsingFailedCount = parsingFailed
+            )
+        }
+        val finalRoomCount = db.kharchaDao().getAllTransactionsSyncForUser(owner)
+            .count { it.userId == owner }
         Log.d(TAG, "Room count after SMS scan: $finalRoomCount (Imported: $imported, Duplicates: $duplicates)")
         Log.d(TAG, "SMS Scan Result: Imported=$imported, Updated=$updated, Duplicates=$duplicates, Ignored=$ignored, NeedsReview=$needsReview, Failed=$parsingFailed")
 
@@ -155,6 +216,7 @@ object SmsParser {
         olderThanTimestamp: Long = 0,
         onProgress: ((scannedCount: Int, totalFound: Int, importedCount: Int, duplicatesCount: Int) -> Unit)? = null
     ): SmsParseResult = withContext(Dispatchers.IO) {
+        val owner = liveAuthenticatedUid() ?: return@withContext emptyParseResult()
         val rawMessages = mutableListOf<RawSms>()
         try {
             val selection = if (newerThanTimestamp > 0 && olderThanTimestamp > 0) {
@@ -203,11 +265,13 @@ object SmsParser {
             Log.e(TAG, "Error querying SMS inbox: ${e.message}", e)
         }
 
-        processSmsList(
+        if (liveAuthenticatedUid() != owner) return@withContext emptyParseResult()
+        processSmsListForOwner(
             context = context,
             smsList = rawMessages,
             newerThanTimestamp = newerThanTimestamp,
             olderThanTimestamp = olderThanTimestamp,
+            owner = owner,
             onProgress = onProgress
         )
     }
@@ -515,6 +579,14 @@ object SmsParser {
             return "INCOME"
         }
 
+        val isIncomingTransferOrUpi = Regex(
+            """\b(?:upi\s+)?(?:payment|transfer)\b.{0,60}\b(?:received|credited|inward)\b|\b(?:received|credited)\b.{0,60}\b(?:via|through|as)\s+(?:upi|bank\s+transfer)\b""",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(lower)
+        if (isIncomingTransferOrUpi) {
+            return "INCOME"
+        }
+
         // Credit Card Purchase Rule (Rule 3): Credit card used/spent/charged is EXPENSE
         val isCreditCardPurchase = (lower.contains("credit card") || lower.contains("credit-card") || lower.contains("card")) &&
             (lower.contains("used for") || lower.contains("used at") || lower.contains("charged") ||
@@ -703,7 +775,11 @@ object SmsParser {
         }.format(java.util.Date())
 
         val stableRef = if (realTxRef.isNotEmpty()) realTxRef else "SMS-TX-${System.currentTimeMillis()}-${(1000..9999).random()}"
-        val originalRef = if (realTxRef.isNotEmpty()) "SMS-REF-$address-$realTxRef" else "SMS-$smsId-$address-$amount-$dateStr"
+        val originalRef = if (realTxRef.isNotEmpty()) {
+            "SMS-REF-$address-$realTxRef"
+        } else {
+            "SMS-EVENT-${smsEventFingerprint(address, body, timestamp)}"
+        }
         val txId = "tx-sms-" + UUID.randomUUID().toString().substring(0, 8)
 
         // Support CC bill payment mapping
@@ -746,6 +822,13 @@ object SmsParser {
         )
 
         return SmsParseStatus.Success(tx)
+    }
+
+    private fun smsEventFingerprint(address: String, body: String, timestamp: Long): String {
+        val eventData = "${address.trim().uppercase(Locale.US)}|$timestamp|${body.trim().replace(Regex("\\s+"), " ")}"
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(eventData.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { byte -> "%02x".format(Locale.US, byte.toInt() and 0xff) }
     }
 
     fun removeUrls(text: String): String {
@@ -1273,22 +1356,29 @@ object SmsParser {
         var extractedDateStr: String? = null
         var extractedTimeStr: String? = null
 
-        // 1. Numeric Date: dd-MM-yy / dd/MM/yyyy
+        // 1. Numeric Date: dd-MM-yy / dd/MM/yyyy, including ISO yyyy-MM-dd.
         try {
-            val dateRegex = Regex("(?:on\\s+|dated\\s+)?(\\d{1,2})[-/](\\d{1,2})[-/](\\d{2,4})", RegexOption.IGNORE_CASE)
-            val match = dateRegex.find(body)
-            if (match != null) {
-                val d = match.groupValues[1].toInt()
-                val m = match.groupValues[2].toInt()
-                var y = match.groupValues[3].toInt()
-                if (y < 100) y += 2000
-                
-                val cal = java.util.Calendar.getInstance()
-                cal.set(y, m - 1, d)
-                extractedDateStr = dateFmt.format(cal.time)
+            val isoMatch = Regex("\\b(\\d{4})-(\\d{1,2})-(\\d{1,2})\\b").find(body)
+            if (isoMatch != null) {
+                extractedDateStr = strictDate(
+                    dateFmt,
+                    isoMatch.groupValues[1].toInt(),
+                    isoMatch.groupValues[2].toInt() - 1,
+                    isoMatch.groupValues[3].toInt()
+                )
+            } else {
+                val dateRegex = Regex("(?:on\\s+|dated\\s+)?(\\d{1,2})[-/](\\d{1,2})[-/](\\d{2,4})", RegexOption.IGNORE_CASE)
+                val match = dateRegex.find(body)
+                if (match != null) {
+                    val d = match.groupValues[1].toInt()
+                    val m = match.groupValues[2].toInt()
+                    var y = match.groupValues[3].toInt()
+                    if (y < 100) y += 2000
+                    extractedDateStr = strictDate(dateFmt, y, m - 1, d)
+                }
             }
         } catch (e: Exception) {
-            // fallback
+            Log.w(TAG, "Unable to parse numeric SMS transaction date", e)
         }
 
         // 2. Named Month Date: dd-MMM-yy / dd-MMM-yyyy / dd MMM yyyy / dd-MMM (e.g., 23-Aug-23, 23 Aug 2026, 23-Aug)
@@ -1306,12 +1396,11 @@ object SmsParser {
                         val currentYear = cal.get(java.util.Calendar.YEAR)
                         var y = monthMatch.groupValues[3].toIntOrNull() ?: currentYear
                         if (y < 100) y += 2000
-                        cal.set(y, m, d)
-                        extractedDateStr = dateFmt.format(cal.time)
+                        extractedDateStr = strictDate(dateFmt, y, m, d)
                     }
                 }
             } catch (e: Exception) {
-                // fallback
+                Log.w(TAG, "Unable to parse named-month SMS transaction date", e)
             }
         }
 
@@ -1336,6 +1425,24 @@ object SmsParser {
         val finalDate = extractedDateStr ?: dateFmt.format(date)
         val finalTime = extractedTimeStr ?: timeFmt.format(date)
         return Pair(finalDate, finalTime)
+    }
+
+    private fun strictDate(
+        formatter: java.text.SimpleDateFormat,
+        year: Int,
+        zeroBasedMonth: Int,
+        day: Int
+    ): String? {
+        val calendar = java.util.Calendar.getInstance().apply {
+            isLenient = false
+            clear()
+            set(year, zeroBasedMonth, day)
+        }
+        return try {
+            formatter.format(calendar.time)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
     }
 
     fun determineCategory(merchant: String, type: String, body: String): String {

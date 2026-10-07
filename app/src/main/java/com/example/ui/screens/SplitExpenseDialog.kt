@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.entity.TransactionEntity
 import com.example.data.entity.TransactionSplitEntity
+import com.example.data.dao.SplitOperationResult
 import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
@@ -48,7 +49,17 @@ fun SplitExpenseDialog(
         allSplits.filter { it.transactionId == tx.id }
     }
 
-    val expenseCategories = categories.filter { !it.isIncome }
+    val splitCategories = when {
+        tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" ||
+            tx.transactionType in setOf(
+                "INTERNAL_TRANSFER",
+                "CARD_PAYMENT",
+                "CREDIT_CARD_PAYMENT",
+                "CREDIT_CARD_BILL_PAYMENT"
+            ) -> categories
+        tx.type == "INCOME" -> categories.filter { it.isIncome }
+        else -> categories.filter { !it.isIncome }
+    }
 
     // Initialize drafts
     val drafts = remember {
@@ -66,7 +77,8 @@ fun SplitExpenseDialog(
                     )
                 }
             } else {
-                val defaultCat = expenseCategories.firstOrNull()?.id ?: tx.categoryId
+                val defaultCat = splitCategories.firstOrNull { it.id == tx.categoryId }?.id
+                    ?: splitCategories.firstOrNull()?.id ?: tx.categoryId
                 val defaultSub = subcategories.firstOrNull { it.categoryId == defaultCat }?.id ?: tx.subcategoryId
                 val halfAmt = tx.amount / 2.0
                 add(
@@ -82,7 +94,7 @@ fun SplitExpenseDialog(
                     SplitDraft(
                         id = "split-2",
                         amountText = if (halfAmt % 1 == 0.0) halfAmt.toLong().toString() else halfAmt.toString(),
-                        categoryId = expenseCategories.getOrNull(1)?.id ?: defaultCat,
+                        categoryId = splitCategories.getOrNull(1)?.id ?: defaultCat,
                         subcategoryId = "",
                         note = ""
                     )
@@ -91,10 +103,17 @@ fun SplitExpenseDialog(
         }
     }
 
-    val totalAmount = tx.amount
-    val allocatedAmount = drafts.sumOf { it.amountText.toDoubleOrNull() ?: 0.0 }
+    val totalAmount = kotlin.math.abs(tx.amount)
+    val allocatedAmount = drafts.sumOf {
+        it.amountText.toDoubleOrNull()?.takeIf { amount -> amount.isFinite() } ?: 0.0
+    }
     val remainingAmount = totalAmount - allocatedAmount
-    val isValidSplit = drafts.size >= 2 && Math.abs(remainingAmount) < 0.01
+    val hasOnlyPositiveAmounts = drafts.all { draft ->
+        draft.amountText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true
+    }
+    val isValidSplit = drafts.size >= 2 && hasOnlyPositiveAmounts &&
+        totalAmount > 0.0 && Math.abs(remainingAmount) < 0.01
+    var splitSaveError by remember(tx.id) { mutableStateOf<String?>(null) }
 
     val formatINR: (Double) -> String = { amt ->
         "₹" + NumberFormat.getNumberInstance(Locale("en", "IN")).format(amt)
@@ -148,12 +167,27 @@ fun SplitExpenseDialog(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text(text = "Split Expense", fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0F172A))
+                            Text(text = "Split Transaction", fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF0F172A))
                             Text(text = "Merchant: ${tx.merchant}", fontSize = 11.sp, color = Color(0xFF64748B))
                         }
                         IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
                             Icon(imageVector = Icons.Default.Close, contentDescription = null, tint = Color(0xFF64748B))
                         }
+                    }
+
+                    if (splitSaveError != null) {
+                        Text(
+                            text = splitSaveError!!,
+                            color = Color(0xFFB91C1C),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    } else if (!hasOnlyPositiveAmounts) {
+                        Text(
+                            text = "Each split amount must be a valid number greater than zero.",
+                            color = Color(0xFFB91C1C),
+                            fontSize = 12.sp
+                        )
                     }
 
                     // Calculation Banner
@@ -240,6 +274,7 @@ fun SplitExpenseDialog(
                                     OutlinedTextField(
                                         value = draft.amountText,
                                         onValueChange = { newAmt ->
+                                            splitSaveError = null
                                             drafts[index] = draft.copy(amountText = newAmt)
                                         },
                                         label = { Text("Amount (₹)") },
@@ -250,6 +285,7 @@ fun SplitExpenseDialog(
                                     OutlinedTextField(
                                         value = draft.note,
                                         onValueChange = { newNote ->
+                                            splitSaveError = null
                                             drafts[index] = draft.copy(note = newNote)
                                         },
                                         label = { Text("Note (Optional)") },
@@ -294,10 +330,11 @@ fun SplitExpenseDialog(
                                         expanded = catExpanded,
                                         onDismissRequest = { catExpanded = false }
                                     ) {
-                                        expenseCategories.forEach { c ->
+                                        splitCategories.forEach { c ->
                                             DropdownMenuItem(
                                                 text = { Text("${c.icon} ${getBilingualName(c.name, c.nameHindi)}") },
                                                 onClick = {
+                                                    splitSaveError = null
                                                     drafts[index] = draft.copy(categoryId = c.id, subcategoryId = "")
                                                     catExpanded = false
                                                 }
@@ -354,6 +391,7 @@ fun SplitExpenseDialog(
                                             DropdownMenuItem(
                                                 text = { Text("${sub.icon} ${getBilingualName(sub.name, sub.nameHindi)}") },
                                                 onClick = {
+                                                    splitSaveError = null
                                                     drafts[index] = draft.copy(subcategoryId = sub.id)
                                                     subcatExpanded = false
                                                 }
@@ -368,7 +406,7 @@ fun SplitExpenseDialog(
                     // Add Split Button
                     OutlinedButton(
                         onClick = {
-                            val nextCat = expenseCategories.firstOrNull()?.id ?: tx.categoryId
+                            val nextCat = splitCategories.firstOrNull()?.id ?: tx.categoryId
                             val fillAmt = if (remainingAmount > 0) remainingAmount else 0.0
                             drafts.add(
                                 SplitDraft(
@@ -396,8 +434,13 @@ fun SplitExpenseDialog(
                         if (existingSplits.isNotEmpty()) {
                             OutlinedButton(
                                 onClick = {
-                                    viewModel.removeTransactionSplits(tx.id)
-                                    onDismiss()
+                                    viewModel.removeTransactionSplits(tx.id) { result ->
+                                        if (result == SplitOperationResult.SAVED) {
+                                            onDismiss()
+                                        } else {
+                                            splitSaveError = "Could not remove the split. The transaction was not changed."
+                                        }
+                                    }
                                 },
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.weight(1f),
@@ -423,8 +466,25 @@ fun SplitExpenseDialog(
                                             updatedAt = now
                                         )
                                     }
-                                    viewModel.saveTransactionSplits(tx.id, splitEntities)
-                                    onDismiss()
+                                    viewModel.saveTransactionSplits(tx.id, splitEntities) { result ->
+                                        if (result == SplitOperationResult.SAVED) {
+                                            onDismiss()
+                                        } else {
+                                            splitSaveError = when (result) {
+                                                SplitOperationResult.INVALID_AMOUNT ->
+                                                    "Each split amount must be greater than zero."
+                                                SplitOperationResult.INVALID_TOTAL ->
+                                                    "Split amounts must equal the transaction total."
+                                                SplitOperationResult.INVALID_REFERENCE ->
+                                                    "A selected category or subcategory is no longer available to this user."
+                                                SplitOperationResult.NOT_FOUND ->
+                                                    "This transaction is no longer available."
+                                                SplitOperationResult.NOT_AUTHENTICATED ->
+                                                    "Sign in again before saving transaction splits."
+                                                else -> "Could not save the split. The transaction was not changed."
+                                            }
+                                        }
+                                    }
                                 }
                             },
                             enabled = isValidSplit,

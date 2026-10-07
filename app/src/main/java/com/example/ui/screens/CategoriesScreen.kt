@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.entity.CategoryEntity
 import com.example.data.entity.SubcategoryEntity
+import com.example.data.dao.SafeDeleteResult
 import com.example.viewmodel.KharchaViewModel
 import java.text.NumberFormat
 import java.util.Locale
@@ -63,7 +64,7 @@ fun CategoriesScreen(
     var showAddCategoryDialog by remember { mutableStateOf(false) }
     var showReorderCategories by remember { mutableStateOf(false) }
     var categoryToMerge by remember { mutableStateOf<CategoryEntity?>(null) }
-    var categoryToDeleteWithWarning by remember { mutableStateOf<Pair<CategoryEntity, Int>?>(null) }
+    var categoryToDeleteWithWarning by remember { mutableStateOf<Pair<CategoryEntity, SafeDeleteResult>?>(null) }
     var categoryToDeleteConfirm by remember { mutableStateOf<CategoryEntity?>(null) }
 
     val categoriesListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
@@ -313,11 +314,10 @@ fun CategoriesScreen(
                                         }
                                         IconButton(
                                             onClick = {
-                                                viewModel.getCategoryTransactionCount(cat.id) { count ->
-                                                    if (count > 0) {
-                                                        categoryToDeleteWithWarning = cat to count
-                                                    } else {
-                                                        categoryToDeleteConfirm = cat
+                                                viewModel.checkCategoryDeleteStatus(cat.id, cat.userId) { status ->
+                                                    when (status) {
+                                                        SafeDeleteResult.AVAILABLE -> categoryToDeleteConfirm = cat
+                                                        else -> categoryToDeleteWithWarning = cat to status
                                                     }
                                                 }
                                             },
@@ -422,11 +422,9 @@ fun CategoriesScreen(
     // Modal: Move Subcategory & Confirmation (Screen 4 & 5)
     if (subcategoryToMove != null) {
         val sub = subcategoryToMove!!
-        val currentParent = categories.find { it.id == sub.categoryId }
 
         MoveSubcategoryFlowDialog(
             subcategory = sub,
-            currentParent = currentParent,
             allCategories = categories,
             onDismiss = { subcategoryToMove = null },
             onConfirmMove = { newCatId, moveTx ->
@@ -480,8 +478,6 @@ fun CategoriesScreen(
         val sub = subcategoryToDelete!!
         DeleteSubcategorySafeDialog(
             subcategory = sub,
-            allCategories = categories,
-            allSubcategories = subcategories,
             viewModel = viewModel,
             onDismiss = { subcategoryToDelete = null }
         )
@@ -501,33 +497,28 @@ fun CategoriesScreen(
         )
     }
 
-    // Modal: Delete Category Warning
+    // Modal: Category deletion is blocked while it has references.
     if (categoryToDeleteWithWarning != null) {
-        val (cat, txCount) = categoryToDeleteWithWarning!!
+        val (cat, status) = categoryToDeleteWithWarning!!
         AlertDialog(
             onDismissRequest = { categoryToDeleteWithWarning = null },
-            title = { Text("Category Has Linked Transactions", fontWeight = FontWeight.Bold) },
+            title = { Text("Cannot Delete Category", fontWeight = FontWeight.Bold) },
             text = {
                 Text(
-                    text = "\"${cat.name}\" is linked to $txCount transaction(s). Directly deleting categories with transactions is disabled to prevent data loss.\n\nWould you like to Merge this category into another category instead?",
+                    text = when (status) {
+                        SafeDeleteResult.IN_USE ->
+                            "Cannot delete this category because existing transactions, splits, or subcategories use it."
+                        SafeDeleteResult.NOT_AUTHENTICATED ->
+                            "Cannot delete this category because no authenticated user is available."
+                        else -> "Cannot delete this category because it is no longer available to this user."
+                    },
                     fontSize = 13.sp,
                     color = Color(0xFF334155)
                 )
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        categoryToDeleteWithWarning = null
-                        categoryToMerge = cat
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
-                ) {
-                    Text("Merge Category")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { categoryToDeleteWithWarning = null }) {
-                    Text("Cancel")
+                Button(onClick = { categoryToDeleteWithWarning = null }) {
+                    Text("OK")
                 }
             }
         )
@@ -536,12 +527,13 @@ fun CategoriesScreen(
     // Modal: Delete Category Confirm (0 Txs)
     if (categoryToDeleteConfirm != null) {
         val cat = categoryToDeleteConfirm!!
+        var isDeleting by remember(cat.id) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { categoryToDeleteConfirm = null },
             title = { Text("Delete Category", fontWeight = FontWeight.Bold) },
             text = {
                 Text(
-                    text = "Are you sure you want to delete \"${cat.icon} ${cat.name}\"? This category has no linked transactions.",
+                    text = "Are you sure you want to delete \"${cat.icon} ${cat.name}\"? It has no linked transactions, splits, or subcategories.",
                     fontSize = 13.sp,
                     color = Color(0xFF334155)
                 )
@@ -549,12 +541,22 @@ fun CategoriesScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        viewModel.deleteCategory(cat.id)
-                        categoryToDeleteConfirm = null
+                        if (!isDeleting) {
+                            isDeleting = true
+                            viewModel.deleteCategory(cat.id, cat.userId) { result ->
+                                if (result == SafeDeleteResult.DELETED) {
+                                    categoryToDeleteConfirm = null
+                                } else {
+                                    categoryToDeleteConfirm = null
+                                    categoryToDeleteWithWarning = cat to result
+                                }
+                            }
+                        }
                     },
+                    enabled = !isDeleting,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
                 ) {
-                    Text("Delete")
+                    Text(if (isDeleting) "Deleting…" else "Delete")
                 }
             },
             dismissButton = {
@@ -966,19 +968,26 @@ fun SubcategoryOptionsBottomSheet(
 @Composable
 fun MoveSubcategoryFlowDialog(
     subcategory: SubcategoryEntity,
-    currentParent: CategoryEntity?,
     allCategories: List<CategoryEntity>,
     onDismiss: () -> Unit,
     onConfirmMove: (newCategoryId: String, moveTransactions: Boolean) -> Unit
 ) {
     var step by remember { mutableStateOf(1) } // Step 1: Select Category, Step 2: Confirmation
-    var selectedTargetId by remember { mutableStateOf(currentParent?.id ?: allCategories.firstOrNull()?.id ?: "") }
+    val eligibleCategories = remember(allCategories, subcategory.categoryId) {
+        allCategories.filter { it.id != subcategory.categoryId }
+    }
+    var selectedTargetId by remember(subcategory.id) {
+        mutableStateOf(eligibleCategories.firstOrNull()?.id ?: "")
+    }
     var searchQuery by remember { mutableStateOf("") }
     var moveExistingTransactions by remember { mutableStateOf(false) } // Safe default: false (move only subcategory)
 
-    val eligibleCategories = remember(allCategories, searchQuery) {
-        if (searchQuery.isBlank()) allCategories
-        else allCategories.filter { it.name.contains(searchQuery, ignoreCase = true) }
+    val filteredCategories = remember(eligibleCategories, searchQuery) {
+        if (searchQuery.isBlank()) eligibleCategories
+        else eligibleCategories.filter {
+            it.name.contains(searchQuery, ignoreCase = true) ||
+                it.nameHindi.contains(searchQuery, ignoreCase = true)
+        }
     }
 
     AlertDialog(
@@ -1016,9 +1025,8 @@ fun MoveSubcategoryFlowDialog(
                         modifier = Modifier.heightIn(max = 220.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(eligibleCategories) { cat ->
+                        items(filteredCategories) { cat ->
                             val isSelected = selectedTargetId == cat.id
-                            val isCurrent = cat.id == subcategory.categoryId
 
                             Card(
                                 onClick = { selectedTargetId = cat.id },
@@ -1043,9 +1051,6 @@ fun MoveSubcategoryFlowDialog(
                                         Text(text = cat.icon, fontSize = 16.sp)
                                         Column {
                                             Text(text = getBilingualName(cat.name, cat.nameHindi), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                                            if (isCurrent) {
-                                                Text(text = "Current Parent", fontSize = 9.sp, color = Color(0xFF64748B))
-                                            }
                                         }
                                     }
                                     RadioButton(
@@ -1097,7 +1102,7 @@ fun MoveSubcategoryFlowDialog(
                 Button(
                     onClick = { step = 2 },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
-                    enabled = selectedTargetId.isNotEmpty() && selectedTargetId != subcategory.categoryId
+                    enabled = filteredCategories.any { it.id == selectedTargetId }
                 ) {
                     Text("Next")
                 }
@@ -1192,88 +1197,63 @@ fun ChangeIconDialog(
 @Composable
 fun DeleteSubcategorySafeDialog(
     subcategory: SubcategoryEntity,
-    allCategories: List<CategoryEntity>,
-    allSubcategories: List<SubcategoryEntity>,
     viewModel: KharchaViewModel,
     onDismiss: () -> Unit
 ) {
-    var deleteOption by remember { mutableStateOf("keep") } // "move_sub", "move_other", "keep"
-    var targetSubId by remember { mutableStateOf("") }
+    var deleteStatus by remember(subcategory.id) { mutableStateOf<SafeDeleteResult?>(null) }
 
-    val eligibleSubs = allSubcategories.filter { it.id != subcategory.id }
+    LaunchedEffect(subcategory.id) {
+        viewModel.checkSubcategoryDeleteStatus(subcategory.id, subcategory.userId) { deleteStatus = it }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Delete Subcategory", fontWeight = FontWeight.Bold) },
         text = {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "Are you sure you want to delete \"${subcategory.icon} ${subcategory.name}\"?",
-                    fontSize = 13.sp,
-                    color = Color(0xFF0F172A)
-                )
-
-                Text(
-                    text = "What do you want to do with historical transactions assigned to this subcategory?",
-                    fontSize = 11.sp,
-                    color = Color(0xFF64748B)
-                )
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { deleteOption = "keep" }
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    RadioButton(selected = deleteOption == "keep", onClick = { deleteOption = "keep" })
-                    Column {
-                        Text(text = "Keep historical classification", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                        Text(text = "Do not modify historical transactions", fontSize = 10.sp, color = Color(0xFF64748B))
-                    }
+            when (deleteStatus) {
+                null -> Text("Checking whether this subcategory can be deleted…")
+                SafeDeleteResult.AVAILABLE ->
+                    Text("Are you sure you want to delete \"${subcategory.icon} ${subcategory.name}\"?")
+                SafeDeleteResult.IN_USE ->
+                    Text("Cannot delete this subcategory because existing transactions or splits use it.")
+                SafeDeleteResult.NOT_AUTHENTICATED ->
+                    Text("Cannot delete this subcategory because no authenticated user is available.")
+                else ->
+                    Text("Cannot delete this subcategory because it is no longer available to this user.")
                 }
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { deleteOption = "move_other" }
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    RadioButton(selected = deleteOption == "move_other", onClick = { deleteOption = "move_other" })
-                    Column {
-                        Text(text = "Move transactions to 'Other'", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                        Text(text = "Reassign to general Other subcategory", fontSize = 10.sp, color = Color(0xFF64748B))
-                    }
-                }
-            }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    when (deleteOption) {
-                        "move_other" -> {
-                            // Find or move to Other
-                            viewModel.deleteSubcategory(subcategory.id)
+            if (deleteStatus == SafeDeleteResult.AVAILABLE) {
+                Button(
+                    onClick = {
+                        deleteStatus = null
+                        viewModel.deleteSubcategory(subcategory.id, subcategory.userId) { result ->
+                            if (result == SafeDeleteResult.DELETED) {
+                                onDismiss()
+                            } else {
+                                deleteStatus = result
+                            }
                         }
-                        else -> {
-                            viewModel.deleteSubcategory(subcategory.id)
-                        }
-                    }
-                    onDismiss()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
-            ) {
-                Text("Delete")
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
+                ) {
+                    Text("Delete")
+                }
+            } else {
+                TextButton(
+                    onClick = onDismiss,
+                    enabled = deleteStatus != null
+                ) {
+                    Text("OK")
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            if (deleteStatus == SafeDeleteResult.AVAILABLE || deleteStatus == null) {
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            } else {
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
         }
     )
 }

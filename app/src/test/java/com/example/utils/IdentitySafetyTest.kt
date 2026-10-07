@@ -250,6 +250,91 @@ class IdentitySafetyTest {
     }
 
     @Test
+    fun duplicateMatchingRequiresIdentityEvidenceAndPreservesTransactionKind() {
+        val base = TransactionEntity(
+            id = "tx-one",
+            amount = 500.0,
+            date = "2026-09-26",
+            time = "10:30",
+            merchant = "Same Merchant",
+            categoryId = "cat-food",
+            subcategoryId = "",
+            note = "",
+            type = "EXPENSE",
+            direction = "DEBIT",
+            source = "SMS",
+            paymentMethod = "Card",
+            accountId = "account-one",
+            last4Digits = "1234",
+            transactionReference = "",
+            originalReference = ""
+        )
+        val sameDetailsDifferentEvents = base.copy(
+            id = "tx-two",
+            source = "NOTIFICATION",
+            accountId = "account-two",
+            originalReference = "NOTIF-EVENT-com.example.bank-456"
+        )
+
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(base, sameDetailsDifferentEvents))
+        assertEquals(
+            "",
+            TransactionIngestionEngine.calculateFingerprint(500.0, "2026-09-26", "1234", "")
+        )
+
+        val repeatedSms = base.copy(
+            id = "tx-retry",
+            originalReference = "SMS-12345-bank-address-500-2026-09-26"
+        )
+        val sameSmsEvent = repeatedSms.copy(id = "tx-retry-again")
+        assertTrue(TransactionIngestionEngine.isDuplicateTransaction(repeatedSms, sameSmsEvent))
+
+        val notificationEvent = base.copy(
+            source = "NOTIFICATION",
+            originalReference = "NOTIF-EVENT-com.example.bank-123456"
+        )
+        assertTrue(TransactionIngestionEngine.isDuplicateTransaction(
+            notificationEvent,
+            notificationEvent.copy(id = "tx-notification-retry")
+        ))
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(
+            notificationEvent,
+            notificationEvent.copy(originalReference = "NOTIF-EVENT-com.example.bank-123457")
+        ))
+
+        val emailEvent = base.copy(source = "EMAIL", originalReference = "EMAIL-message-id-456")
+        assertTrue(TransactionIngestionEngine.isDuplicateTransaction(
+            emailEvent,
+            emailEvent.copy(id = "tx-email-retry")
+        ))
+
+        val sameEventWithDifferentDirection = sameSmsEvent.copy(
+            type = "INCOME",
+            direction = "CREDIT"
+        )
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(repeatedSms, sameEventWithDifferentDirection))
+
+        val sameReferenceIncome = base.copy(
+            type = "INCOME",
+            direction = "CREDIT",
+            transactionReference = "UTR-123456789"
+        )
+        val sameReferenceExpense = base.copy(transactionReference = "UTR-123456789")
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(sameReferenceIncome, sameReferenceExpense))
+
+        val transfer = base.copy(
+            type = "INTERNAL_TRANSFER",
+            transactionType = "INTERNAL_TRANSFER",
+            isInternalTransfer = true,
+            transactionReference = "UTR-123456789"
+        )
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(sameReferenceExpense, transfer))
+
+        val foreignOwner = sameReferenceExpense.copy(userId = "another-user")
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(sameReferenceExpense.copy(userId = "current-user"), foreignOwner))
+    }
+
+    @Test
     fun testH_PoweredByAxis_WithSbiActual() {
         val text = "SBI Card XXXX2663 debited. Powered by Axis Bank UPI."
         val evidence = TransactionIdentityResolver.IdentityEvidence(

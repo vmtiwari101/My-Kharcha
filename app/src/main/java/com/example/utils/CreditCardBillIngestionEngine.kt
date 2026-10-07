@@ -5,9 +5,11 @@ import android.util.Log
 import com.example.data.database.AppDatabase
 import com.example.data.entity.AccountEntity
 import com.example.data.entity.CardEntity
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
+import java.text.ParsePosition
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -38,6 +40,22 @@ sealed class BillIngestionResult {
 object CreditCardBillIngestionEngine {
 
     private const val TAG = "CCBillIngestion"
+    private const val LEGACY_OWNER = "legacy:unassigned"
+
+    @Volatile
+    internal var liveAuthenticatedUidProvider: () -> String? = {
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase authentication is unavailable", e)
+            null
+        }
+    }
+
+    private fun authenticatedOwner(): String? =
+        liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+    private fun isCurrentOwner(owner: String): Boolean = authenticatedOwner() == owner
 
     private fun getNowIsoString(): String {
         return SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
@@ -166,7 +184,59 @@ object CreditCardBillIngestionEngine {
     suspend fun ingestBillInfo(
         context: Context,
         billInfo: CreditCardBillInfo
+    ): BillIngestionResult {
+        return ingestBillInfoForAuthenticatedOwner(
+            context = context,
+            billInfo = billInfo,
+            expectedOwnerUid = null,
+            requireExpectedOwner = false
+        )
+    }
+
+    suspend fun ingestBillInfo(
+        context: Context,
+        billInfo: CreditCardBillInfo,
+        expectedOwnerUid: String?
+    ): BillIngestionResult {
+        return ingestBillInfoForAuthenticatedOwner(
+            context = context,
+            billInfo = billInfo,
+            expectedOwnerUid = expectedOwnerUid,
+            requireExpectedOwner = true
+        )
+    }
+
+    private suspend fun ingestBillInfoForAuthenticatedOwner(
+        context: Context,
+        billInfo: CreditCardBillInfo,
+        expectedOwnerUid: String?,
+        requireExpectedOwner: Boolean
+    ): BillIngestionResult {
+        val owner = authenticatedOwner()
+        if (owner == null) {
+            Log.w(TAG, "Bill ingestion rejected because no live authenticated Firebase user is available")
+            return BillIngestionResult.InvalidData
+        }
+        if (requireExpectedOwner &&
+            (expectedOwnerUid.isNullOrBlank() ||
+                expectedOwnerUid == LEGACY_OWNER ||
+                expectedOwnerUid != owner)
+        ) {
+            Log.w(TAG, "Bill ingestion rejected because the live owner does not match the expected email owner")
+            return BillIngestionResult.InvalidData
+        }
+        return ingestBillInfoForOwner(context, billInfo, owner)
+    }
+
+    private suspend fun ingestBillInfoForOwner(
+        context: Context,
+        billInfo: CreditCardBillInfo,
+        owner: String
     ): BillIngestionResult = withContext(Dispatchers.IO) {
+        if (!isCurrentOwner(owner)) {
+            Log.w(TAG, "Bill ingestion stopped because the authenticated user changed")
+            return@withContext BillIngestionResult.InvalidData
+        }
         if (billInfo.bankName.isBlank()) {
             return@withContext BillIngestionResult.InvalidData
         }
@@ -174,29 +244,36 @@ object CreditCardBillIngestionEngine {
         val db = AppDatabase.getDatabase(context)
         val dao = db.kharchaDao()
 
-        val accounts = dao.getAllAccountsSync()
-        val cards = dao.getAllCardsSync()
-        val transactions = dao.getAllTransactionsSync()
+        val accounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
+        val cards = dao.getAllCardsSyncForUser(owner).filter { it.userId == owner }
+        val transactions = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
+        if (!isCurrentOwner(owner)) {
+            return@withContext BillIngestionResult.InvalidData
+        }
 
         // Strict Matching: Match ONLY by normalized bank name AND 4-digit last4.
         val matchedCard = if (billInfo.last4Digits.length == 4) {
             cards.find { card ->
-                card.last4Digits == billInfo.last4Digits &&
+                card.userId == owner && card.last4Digits == billInfo.last4Digits &&
                         TransactionIngestionEngine.isBankNameMatch(card.name, billInfo.bankName)
             }
         } else null
 
         val matchedAccount = if (billInfo.last4Digits.length == 4) {
             accounts.find { acc ->
-                acc.last4Digits == billInfo.last4Digits &&
+                acc.userId == owner && acc.last4Digits == billInfo.last4Digits &&
                         (acc.type.equals("Credit Card", ignoreCase = true) || matchedCard != null) &&
                         TransactionIngestionEngine.isBankNameMatch(acc.bankName.ifEmpty { acc.name }, billInfo.bankName)
-            } ?: if (matchedCard != null) accounts.find { it.id == matchedCard.accountId } else null
+            } ?: if (matchedCard != null) {
+                accounts.find { it.userId == owner && it.id == matchedCard.accountId }
+            } else null
         } else null
 
         if (matchedCard == null && matchedAccount == null) {
             Log.d(TAG, "No matching existing Credit Card found for ${billInfo.bankName} •••• ${billInfo.last4Digits}. Preserving as Identified but Unlinked reminder.")
-            saveUnlinkedReminder(context, billInfo)
+            if (!isCurrentOwner(owner) || !saveUnlinkedReminder(context, owner, billInfo)) {
+                return@withContext BillIngestionResult.InvalidData
+            }
             return@withContext BillIngestionResult.UnlinkedReminder(billInfo)
         }
 
@@ -213,29 +290,39 @@ object CreditCardBillIngestionEngine {
         // Payment-aware behavior: Calculate payments made since or towards this bill
         val cardId = matchedCard?.id
         val accId = matchedAccount?.id ?: matchedCard?.accountId ?: ""
-
-        val recentPayments = transactions.filter { tx ->
-            val isPayment = tx.transactionType == "CARD_PAYMENT" || tx.merchant.contains("Credit Card Bill Payment", true) ||
-                    tx.note.contains("credit card payment", true) || tx.note.contains("paid towards credit card", true)
-            if (!isPayment) return@filter false
-
-            val isLinkedToThisCard = (cardId != null && tx.counterpartyAccountId == cardId) ||
-                    (accId.isNotEmpty() && tx.counterpartyAccountId == accId) ||
-                    (accId.isNotEmpty() && tx.accountId == accId) ||
-                    (tx.last4Digits == billInfo.last4Digits)
-
-            isLinkedToThisCard
+        if (matchedCard?.userId?.let { it != owner } == true ||
+            matchedAccount?.userId?.let { it != owner } == true
+        ) {
+            Log.w(TAG, "Bill update rejected because matched account/card ownership is inconsistent")
+            return@withContext BillIngestionResult.InvalidData
         }
 
-        val totalPayments = recentPayments.sumOf { it.amount }
-        // Note: The new statement Total Amount Due establishes the bill cycle's baseline outstanding.
-        val effectiveOutstanding = billInfo.totalAmountDue
+        val recentPayments = transactions.filter { tx ->
+            TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+                tx,
+                cardId,
+                accId,
+                billInfo.last4Digits
+            )
+        }
+
+        val statementDate = parseFullDate(billInfo.statementDateStr)
+        val paymentsSinceStatement = if (statementDate == null) {
+            emptyList()
+        } else {
+            recentPayments.filter { transaction ->
+                parseFullDate(transaction.date)?.after(statementDate) == true
+            }
+        }
+        val effectiveOutstanding = (billInfo.totalAmountDue - paymentsSinceStatement.sumOf { it.amount })
+            .coerceAtLeast(0.0)
 
         val nowIso = getNowIsoString()
         var updatedAccount: AccountEntity? = null
         var updatedCard: CardEntity? = null
 
         if (matchedAccount != null) {
+            if (!isCurrentOwner(owner)) return@withContext BillIngestionResult.InvalidData
             val dueDay = if (billInfo.dueDate in 1..31) billInfo.dueDate else matchedAccount.dueDate
             updatedAccount = matchedAccount.copy(
                 outstandingAmount = effectiveOutstanding,
@@ -248,11 +335,11 @@ object CreditCardBillIngestionEngine {
                 lastBillUpdatedAt = nowIso,
                 updatedAt = nowIso
             )
-            dao.insertAccount(updatedAccount)
             Log.d(TAG, "Updated AccountEntity bill info for ${updatedAccount.name} (${billInfo.bankName} •••• ${billInfo.last4Digits}): Outstanding=₹$effectiveOutstanding, MinDue=₹${updatedAccount.minimumAmountDue}, DueDate=${updatedAccount.dueDate}")
         }
 
         if (matchedCard != null) {
+            if (!isCurrentOwner(owner)) return@withContext BillIngestionResult.InvalidData
             val dueDay = if (billInfo.dueDate in 1..31) billInfo.dueDate else matchedCard.dueDate
             updatedCard = matchedCard.copy(
                 outstandingAmount = effectiveOutstanding,
@@ -265,8 +352,18 @@ object CreditCardBillIngestionEngine {
                 lastBillUpdatedAt = nowIso,
                 updatedAt = nowIso
             )
-            dao.insertCard(updatedCard)
             Log.d(TAG, "Updated CardEntity bill info for ${updatedCard.name} (${billInfo.bankName} •••• ${billInfo.last4Digits}): Outstanding=₹$effectiveOutstanding, MinDue=₹${updatedCard.minimumAmountDue}, DueDate=${updatedCard.dueDate}")
+        }
+        if (!isCurrentOwner(owner)) return@withContext BillIngestionResult.InvalidData
+        if (!dao.applyCardBillSnapshot(
+                userId = owner,
+                account = updatedAccount,
+                card = updatedCard,
+                includedPaymentIds = recentPayments.map { it.id },
+                targetIds = listOf(accId, cardId).filter { it.isNotBlank() }
+            )
+        ) {
+            return@withContext BillIngestionResult.InvalidData
         }
 
         // Trigger / Reschedule Payment Due Reminders with the updated bill information
@@ -276,6 +373,7 @@ object CreditCardBillIngestionEngine {
             ?: 0
 
         if (effectiveDueDay in 1..31 && effectiveOutstanding > 0.0) {
+            if (!isCurrentOwner(owner)) return@withContext BillIngestionResult.InvalidData
             CreditCardReminderManager.scheduleRemindersForCard(
                 context = context,
                 bankName = billInfo.bankName,
@@ -447,10 +545,34 @@ object CreditCardBillIngestionEngine {
         return 0
     }
 
-    private fun saveUnlinkedReminder(context: Context, billInfo: CreditCardBillInfo) {
+    private fun parseFullDate(value: String): Date? {
+        if (value.isBlank()) return null
+        val formats = listOf(
+            "yyyy-MM-dd",
+            "dd/MM/yyyy",
+            "dd-MM-yyyy",
+            "dd/MM/yy",
+            "dd-MM-yy",
+            "dd MMM yyyy",
+            "d MMM yyyy"
+        )
+        for (format in formats) {
+            val parser = SimpleDateFormat(format, Locale.ENGLISH).apply {
+                isLenient = false
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            val position = ParsePosition(0)
+            val parsed = parser.parse(value.trim(), position)
+            if (parsed != null && position.index == value.trim().length) return parsed
+        }
+        return null
+    }
+
+    private fun saveUnlinkedReminder(context: Context, owner: String, billInfo: CreditCardBillInfo): Boolean {
         try {
+            if (!isCurrentOwner(owner)) return false
             val prefs = context.getSharedPreferences("unlinked_reminders_pref", Context.MODE_PRIVATE)
-            val key = "unlinked_${billInfo.bankName.lowercase(Locale.ENGLISH).replace(" ", "")}_${billInfo.last4Digits.ifEmpty { "0000" }}_${billInfo.messageId}"
+            val key = "unlinked_${owner}_${billInfo.bankName.lowercase(Locale.ENGLISH).replace(" ", "")}_${billInfo.last4Digits.ifEmpty { "0000" }}_${billInfo.messageId}"
             val json = """
                 {
                     "bankName": "${billInfo.bankName}",
@@ -465,8 +587,10 @@ object CreditCardBillIngestionEngine {
                 }
             """.trimIndent()
             prefs.edit().putString(key, json).apply()
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save unlinked reminder: ${e.message}")
+            return false
         }
     }
 }

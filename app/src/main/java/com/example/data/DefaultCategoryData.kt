@@ -5,6 +5,7 @@ import com.example.data.dao.KharchaDao
 import com.example.data.entity.AccountEntity
 import com.example.data.entity.CategoryEntity
 import com.example.data.entity.SubcategoryEntity
+import java.util.Locale
 
 object DefaultCategoryData {
     private const val TAG = "DefaultCategoryData"
@@ -50,6 +51,40 @@ object DefaultCategoryData {
         CategoryEntity("cat-refund", "Refund", "धनवापसी", "🔄", "#3B82F6", isDefault = true, isActive = true, isIncome = true, createdAt = DEFAULT_DATE, updatedAt = DEFAULT_DATE),
         CategoryEntity("cat-interest", "Interest", "ब्याज", "💰", "#F59E0B", isDefault = true, isActive = true, isIncome = true, createdAt = DEFAULT_DATE, updatedAt = DEFAULT_DATE),
         CategoryEntity("cat-income-other", "Other Income", "अन्य आय", "💵", "#64748B", isDefault = true, isActive = true, isIncome = true, createdAt = DEFAULT_DATE, updatedAt = DEFAULT_DATE)
+    )
+
+    private val grocerySubcategoryAdditions = listOf(
+        SubcategoryEntity("sub-groc-12", "cat-groceries", "Vegetables", "सब्ज़ियाँ", "🥦", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-13", "cat-groceries", "Fruits", "फल", "🍎", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-14", "cat-groceries", "Potato & Onion", "आलू और प्याज़", "🥔", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-15", "cat-groceries", "Leafy Vegetables", "हरी पत्तेदार सब्ज़ियाँ", "🥬", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-16", "cat-groceries", "Dairy", "डेयरी", "🥛", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-17", "cat-groceries", "Milk", "दूध", "🥛", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-18", "cat-groceries", "Curd/Yogurt", "दही", "🥣", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-19", "cat-groceries", "Paneer", "पनीर", "🧀", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-20", "cat-groceries", "Butter", "मक्खन", "🧈", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-21", "cat-groceries", "Cheese", "चीज़", "🧀", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-22", "cat-groceries", "Ghee", "घी", "🫙", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-23", "cat-groceries", "Eggs", "अंडे", "🥚", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-24", "cat-groceries", "Maida", "मैदा", "🌾", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-25", "cat-groceries", "Grains", "अनाज", "🌾", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-26", "cat-groceries", "Poha", "पोहा", "🍚", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-27", "cat-groceries", "Oats", "ओट्स", "🥣", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-28", "cat-groceries", "Bread", "ब्रेड", "🍞", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-29", "cat-groceries", "Biscuits", "बिस्कुट", "🍪", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-30", "cat-groceries", "Namkeen/Snacks", "नमकीन/स्नैक्स", "🥨", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-31", "cat-groceries", "Dry Fruits", "सूखे मेवे", "🥜", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-32", "cat-groceries", "Nuts & Seeds", "मेवे और बीज", "🌰", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-33", "cat-groceries", "Sauces & Spreads", "सॉस और स्प्रेड", "🫙", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-34", "cat-groceries", "Pickles", "अचार", "🥒", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-35", "cat-groceries", "Packaged Food", "पैकेज्ड फूड", "📦", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-36", "cat-groceries", "Frozen Food", "फ्रोजन फूड", "🧊", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-37", "cat-groceries", "Instant Food", "इंस्टेंट फूड", "🍜", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-38", "cat-groceries", "Sweets", "मिठाई", "🍬", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-39", "cat-groceries", "Juice & Beverages", "जूस और पेय", "🧃", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-40", "cat-groceries", "Water", "पानी", "💧", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-41", "cat-groceries", "Baby Food", "बेबी फूड", "🍼", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE),
+        SubcategoryEntity("sub-groc-42", "cat-groceries", "Organic/Health Food", "ऑर्गेनिक/हेल्थ फूड", "🌱", "#059669", true, true, DEFAULT_DATE, DEFAULT_DATE)
     )
 
     val defaultSubcategories: List<SubcategoryEntity> = listOf(
@@ -375,31 +410,130 @@ object DefaultCategoryData {
         SubcategoryEntity("sub-inco-2", "cat-income-other", "Cash Received", "नकद प्राप्त हुआ", "💵", "#475569", true, true, DEFAULT_DATE, DEFAULT_DATE),
         SubcategoryEntity("sub-inco-3", "cat-income-other", "Freelance Income", "फ्रीलांस आय", "💻", "#334155", true, true, DEFAULT_DATE, DEFAULT_DATE),
         SubcategoryEntity("sub-inco-4", "cat-income-other", "Other Income", "अन्य आय", "💰", "#1E293B", true, true, DEFAULT_DATE, DEFAULT_DATE)
+    ) + grocerySubcategoryAdditions
+
+    private val groceryNameEquivalenceGroups = listOf(
+        setOf("vegetables", "vegetable", "सब्ज़ियाँ"),
+        setOf("fruits", "fruit", "फल"),
+        setOf("potato & onion", "potatoes and onions", "potatoes & onions", "आलू और प्याज़"),
+        setOf("leafy vegetables", "leafy greens", "हरी पत्तेदार सब्ज़ियाँ"),
+        setOf("dairy", "dairy & milk", "डेयरी"),
+        setOf("curd/yogurt", "curd", "yogurt", "दही"),
+        setOf("flour/atta", "wheat/flour", "atta", "गेहूँ/आटा", "आटा"),
+        setOf("pulses/dal", "pulses", "dal", "दाल"),
+        setOf("cooking oil", "oil", "खाद्य तेल", "तेल"),
+        setOf("namkeen/snacks", "namkeen", "snacks", "नमकीन/स्नैक्स"),
+        setOf("dry fruits", "dry fruit", "सूखे मेवे"),
+        setOf("nuts & seeds", "nuts and seeds", "मेवे और बीज"),
+        setOf("juice & beverages", "juice", "beverages", "जूस और पेय"),
+        setOf("packaged food", "packaged groceries", "पैकेज्ड फूड"),
+        setOf("frozen food", "frozen groceries", "फ्रोजन फूड"),
+        setOf("instant food", "instant meals", "ready to eat", "इंस्टेंट फूड"),
+        setOf("organic/health food", "organic food", "health food", "ऑर्गेनिक/हेल्थ फूड"),
+        setOf("baby food", "infant food", "बेबी फूड"),
+        setOf("other grocery", "अन्य किराना")
     )
+
+    private fun normalizeGroceryLabel(value: String): String {
+        val label = value.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
+        return when {
+            label.length > 4 && label.endsWith("ies") -> label.dropLast(3) + "y"
+            label.length > 3 && label.endsWith("s") -> label.dropLast(1)
+            else -> label
+        }
+    }
+
+    private fun areEquivalentGrocerySubcategories(
+        existing: SubcategoryEntity,
+        requested: SubcategoryEntity
+    ): Boolean {
+        val existingLabels = setOf(existing.name, existing.nameHindi)
+            .filter(String::isNotBlank)
+            .map(::normalizeGroceryLabel)
+            .toSet()
+        val requestedLabels = setOf(requested.name, requested.nameHindi)
+            .filter(String::isNotBlank)
+            .map(::normalizeGroceryLabel)
+            .toSet()
+
+        if (existingLabels.intersect(requestedLabels).isNotEmpty()) return true
+
+        return groceryNameEquivalenceGroups.any { aliases ->
+            val normalizedAliases = aliases.map(::normalizeGroceryLabel).toSet()
+            existingLabels.any { it in normalizedAliases } &&
+                requestedLabels.any { it in normalizedAliases }
+        }
+    }
+
+    private fun isGroceryCategory(category: CategoryEntity): Boolean {
+        val groceryIds = setOf("cat-groceries", "cat-grocery")
+        val groceryNames = setOf("grocery", "groceries", "grocery/ration")
+            .map(::normalizeGroceryLabel)
+        return category.id in groceryIds ||
+            normalizeGroceryLabel(category.name) in groceryNames ||
+            normalizeGroceryLabel(category.nameHindi) == normalizeGroceryLabel("किराना")
+    }
+
+    private suspend fun addMissingGrocerySubcategories(
+        dao: KharchaDao,
+        categories: List<CategoryEntity>,
+        existingSubcategories: MutableList<SubcategoryEntity>
+    ) {
+        val groceryCategoriesByOwner = categories.filter(::isGroceryCategory).groupBy { it.userId }
+
+        for ((userId, userGroceryCategories) in groceryCategoriesByOwner) {
+            val targetCategory = userGroceryCategories.minBy { category ->
+                when {
+                    category.id == "cat-groceries" -> 0
+                    normalizeGroceryLabel(category.name) == normalizeGroceryLabel("Groceries") -> 1
+                    category.id == "cat-grocery" -> 2
+                    else -> 3
+                }
+            }
+            val groceryCategoryIds = userGroceryCategories.mapTo(mutableSetOf()) { it.id }.apply {
+                add("cat-grocery")
+                add("cat-groceries")
+            }
+
+            for (requested in grocerySubcategoryAdditions) {
+                val existingEquivalent = existingSubcategories.any { existing ->
+                    existing.userId == userId &&
+                        existing.categoryId in groceryCategoryIds &&
+                        areEquivalentGrocerySubcategories(existing, requested)
+                }
+                if (existingEquivalent) continue
+
+                var uniqueId = requested.id
+                var suffix = 2
+                while (existingSubcategories.any { it.userId == userId && it.id == uniqueId }) {
+                    uniqueId = "${requested.id}-$suffix"
+                    suffix += 1
+                }
+
+                val addition = requested.copy(
+                    id = uniqueId,
+                    categoryId = targetCategory.id,
+                    userId = userId
+                )
+                dao.insertSubcategory(addition)
+                existingSubcategories.add(addition)
+            }
+        }
+    }
 
     /**
      * Restores and expands categories and subcategories safely without altering or deleting
      * existing user records or breaking existing transaction foreign keys / IDs.
      */
-    suspend fun restoreAndExpandCategoriesAndSubcategories(dao: KharchaDao) {
+    suspend fun restoreAndExpandCategoriesAndSubcategories(
+        dao: KharchaDao,
+        ensureCashAccount: Boolean = true
+    ) {
         try {
-            // 0. Auto-merge legacy duplicate cat-grocery or same-named categories into cat-groceries safely
-            val initialCats = dao.getAllCategoriesSync()
-            val hasGroceries = initialCats.find { it.id == "cat-groceries" || it.name.equals("Groceries", ignoreCase = true) }
-            val legacyGrocery = initialCats.find { it.id == "cat-grocery" || (it.id != hasGroceries?.id && (it.name.equals("Grocery/Ration", ignoreCase = true) || it.name.equals("Groceries", ignoreCase = true))) }
-            if (hasGroceries != null && legacyGrocery != null && hasGroceries.id != legacyGrocery.id) {
-                Log.d(TAG, "Auto-merging legacy duplicate category '${legacyGrocery.name}' into '${hasGroceries.name}'")
-                val now = DEFAULT_DATE
-                dao.reassignTransactionsCategory(legacyGrocery.id, hasGroceries.id, now)
-                dao.reassignSplitsCategory(legacyGrocery.id, hasGroceries.id)
-                dao.reassignSubcategoriesCategory(legacyGrocery.id, hasGroceries.id, now)
-                dao.deleteCategory(legacyGrocery.id)
-            }
-
             val existingCats = dao.getAllCategoriesSync().toMutableList()
             val existingSubs = dao.getAllSubcategoriesSync().toMutableList()
 
-            // 1. Ensure all default categories exist with proper icons and colours
+            // 1. Add missing default categories without rewriting existing user values.
             for (defCat in defaultCategories) {
                 val match = existingCats.find { it.id == defCat.id }
                     ?: existingCats.find { it.name.equals(defCat.name, ignoreCase = true) }
@@ -408,16 +542,6 @@ object DefaultCategoryData {
                     dao.insertCategory(defCat)
                     existingCats.add(defCat)
                     Log.d(TAG, "Restored missing default category: ${defCat.name} (${defCat.id})")
-                } else {
-                    // If existing category has blank icon, colour or nameHindi, heal it
-                    if (match.icon.isBlank() || match.colour.isBlank() || match.icon == "📁" || match.nameHindi.isBlank()) {
-                        val healed = match.copy(
-                            icon = if (match.icon.isBlank() || match.icon == "📁") defCat.icon else match.icon,
-                            colour = if (match.colour.isBlank()) defCat.colour else match.colour,
-                            nameHindi = if (match.nameHindi.isBlank()) defCat.nameHindi else match.nameHindi
-                        )
-                        dao.insertCategory(healed)
-                    }
                 }
             }
 
@@ -426,8 +550,10 @@ object DefaultCategoryData {
             val catNameToId = finalCats.associate { it.name.lowercase().trim() to it.id }
             val catIdToCat = finalCats.associateBy { it.id }
 
-            // 2. Ensure all default subcategories exist with proper icons and colours
+            // 2. Add missing defaults while leaving existing subcategories untouched.
             for (defSub in defaultSubcategories) {
+                if (grocerySubcategoryAdditions.any { it.id == defSub.id }) continue
+
                 // Find parent category in DB
                 val targetCat = catIdToCat[defSub.categoryId]
                     ?: catNameToId[defaultCategories.find { it.id == defSub.categoryId }?.name?.lowercase()?.trim()]?.let { catIdToCat[it] }
@@ -436,28 +562,41 @@ object DefaultCategoryData {
                 val targetCatId = targetCat.id
 
                 val subMatch = existingSubs.find {
-                    it.categoryId == targetCatId && it.name.equals(defSub.name, ignoreCase = true)
+                    it.userId == targetCat.userId &&
+                        it.categoryId == targetCatId &&
+                        it.name.equals(defSub.name, ignoreCase = true)
                 }
 
-                if (subMatch == null) {
-                    val subToInsert = defSub.copy(categoryId = targetCatId)
+                if (defSub.categoryId == "cat-grocery") {
+                    val groceryCategoryIds = finalCats
+                        .filter { it.userId == targetCat.userId && isGroceryCategory(it) }
+                        .mapTo(mutableSetOf()) { it.id }
+                        .apply {
+                            add("cat-grocery")
+                            add("cat-groceries")
+                        }
+                    if (existingSubs.any { existing ->
+                            existing.userId == targetCat.userId &&
+                                existing.categoryId in groceryCategoryIds &&
+                                areEquivalentGrocerySubcategories(existing, defSub)
+                        }
+                    ) {
+                        continue
+                    }
+                }
+
+                if (subMatch == null && existingSubs.none { it.userId == targetCat.userId && it.id == defSub.id }) {
+                    val subToInsert = defSub.copy(categoryId = targetCatId, userId = targetCat.userId)
                     dao.insertSubcategory(subToInsert)
                     existingSubs.add(subToInsert)
                     Log.d(TAG, "Restored missing subcategory: ${defSub.name} for ${targetCat.name}")
-                } else {
-                    // Heal blank icons, colors or nameHindi
-                    if (subMatch.icon.isBlank() || subMatch.colour.isBlank() || subMatch.nameHindi.isBlank()) {
-                        val healed = subMatch.copy(
-                            icon = if (subMatch.icon.isBlank()) defSub.icon else subMatch.icon,
-                            colour = if (subMatch.colour.isBlank()) defSub.colour else subMatch.colour,
-                            nameHindi = if (subMatch.nameHindi.isBlank()) defSub.nameHindi else subMatch.nameHindi
-                        )
-                        dao.insertSubcategory(healed)
-                    }
                 }
             }
-            // 3. Ensure a canonical active generic Cash account exists
-            ensureDefaultCashAccount(dao)
+            addMissingGrocerySubcategories(dao, finalCats, existingSubs)
+
+            if (ensureCashAccount) {
+                ensureDefaultCashAccount(dao)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error restoring categories and subcategories: ${e.message}", e)
         }

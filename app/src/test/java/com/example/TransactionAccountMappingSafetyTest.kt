@@ -276,6 +276,13 @@ class TransactionAccountMappingSafetyTest {
         val txs = dao.getAllTransactionsSync()
         // Exactly two transactions
         assertEquals(2, txs.size)
+        val (_, retryStatus) = TransactionIngestionEngine.ingestTransaction(
+            context,
+            rawDebit,
+            "SBIBANK $debitSms"
+        )
+        assertEquals(IngestionStatus.DUPLICATE, retryStatus)
+        assertEquals(2, dao.getAllTransactionsSync().size)
 
         val debitTx = txs.find { it.accountId == "acc-sbi-1" }
         val creditTx = txs.find { it.accountId == "acc-hdfc-1" }

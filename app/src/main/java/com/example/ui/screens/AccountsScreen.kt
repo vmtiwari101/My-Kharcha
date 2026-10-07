@@ -687,12 +687,32 @@ fun AccountsScreen(
                                 )
 
                                 if (isCreditCardAcc) {
-                                    val expenseTotal = accTxs.filter { com.example.utils.TransactionIdentityResolver.isCreditCardPurchase(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
-                                    val paymentTotal = accTxs.filter { com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(it, null, acc.id, acc.last4Digits) }.sumOf { it.amount }
-                                    
-                                    // Use anchored calculation for Credit Cards: initialBalance (representing Initial Debt) + current net transactions.
-                                    // This ensures that balance updates from SMS/Notifications are respected as the 'anchor' point.
-                                    val effectiveOutstanding = Math.max(0.0, acc.initialBalance + (expenseTotal - paymentTotal))
+                                    val hasCardBalanceActivity = accTxs.any { tx ->
+                                        com.example.utils.TransactionIdentityResolver.isCreditCardPurchase(
+                                            tx,
+                                            null,
+                                            acc.id,
+                                            acc.last4Digits
+                                        ) || com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+                                            tx,
+                                            null,
+                                            acc.id,
+                                            acc.last4Digits
+                                        )
+                                    }
+                                    val effectiveOutstanding = if (
+                                        hasCardBalanceActivity || acc.initialBalance != 0.0
+                                    ) {
+                                        com.example.utils.TransactionIdentityResolver.creditCardOutstandingFromAnchor(
+                                            acc.initialBalance,
+                                            accTxs,
+                                            null,
+                                            acc.id,
+                                            acc.last4Digits
+                                        )
+                                    } else {
+                                        acc.outstandingAmount
+                                    }
 
                                     val latestTx = accTxs.maxByOrNull { it.date + it.time }
                                     CreditCardAccountManagementCard(
@@ -1767,7 +1787,11 @@ fun AccountsScreen(
                             "Cash" -> "#D97706"
                             else -> "#0284C7"
                         }
-                        val initialBalance = if (type == "Bank Account") (initialBalanceStr.toDoubleOrNull() ?: 0.0) else 0.0
+                        val initialBalance = when (type) {
+                            "Bank Account" -> initialBalanceStr.toDoubleOrNull() ?: 0.0
+                            "Credit Card" -> outstanding
+                            else -> 0.0
+                        }
                         val finalBank = bankName.trim().ifEmpty { name.trim() }
                         val finalLast4 = last4Digits.trim()
                         val newCardKey = CreditCardReminderManager.getCardKey(finalBank, finalLast4)
@@ -2679,17 +2703,39 @@ fun EditAccountDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val transactions by viewModel.transactions.collectAsState()
     var name by remember { mutableStateOf(acc.name) }
     var type by remember { mutableStateOf(acc.type) }
     var bankName by remember { mutableStateOf(acc.bankName) }
     var digits by remember { mutableStateOf(acc.last4Digits) }
     var creditLimitStr by remember { mutableStateOf(if (acc.creditLimit > 0) acc.creditLimit.toString() else "") }
-    var outstandingStr by remember { mutableStateOf(if (acc.outstandingAmount > 0) acc.outstandingAmount.toString() else "") }
+    val trackedOutstanding = com.example.utils.TransactionIdentityResolver.creditCardOutstandingFromAnchor(
+        acc.initialBalance,
+        transactions,
+        null,
+        acc.id,
+        acc.last4Digits
+    )
+    val hasCardBalanceActivity = transactions.any { tx ->
+        com.example.utils.TransactionIdentityResolver.isCreditCardPurchase(tx, null, acc.id, acc.last4Digits) ||
+            com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(tx, null, acc.id, acc.last4Digits)
+    }
+    val currentOutstanding = if (hasCardBalanceActivity || acc.initialBalance != 0.0) {
+        trackedOutstanding
+    } else {
+        acc.outstandingAmount
+    }
+    var outstandingStr by remember(acc.id) {
+        mutableStateOf(if (currentOutstanding > 0) currentOutstanding.toString() else "")
+    }
     var billingDateStr by remember { mutableStateOf(if (acc.billingDate in 1..31) acc.billingDate.toString() else "") }
     var dueDateStr by remember { mutableStateOf(if (acc.dueDate in 1..31) acc.dueDate.toString() else "") }
     var isDefault by remember { mutableStateOf(acc.isDefault) }
     var isOwnedByMe by remember { mutableStateOf(acc.isOwnedByMe) }
-    var initialBalanceStr by remember { mutableStateOf(if (acc.initialBalance != 0.0) acc.initialBalance.toString() else "") }
+    val currentAccountBalance = calculateAccountBalance(acc.id, transactions, acc.initialBalance)
+    var initialBalanceStr by remember(acc.id) {
+        mutableStateOf(if (currentAccountBalance != 0.0) currentAccountBalance.toString() else "")
+    }
     var validationError by remember { mutableStateOf<String?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
@@ -2895,7 +2941,21 @@ fun EditAccountDialog(
                         return@Button
                     }
 
-                    val initialBalance = if (type == "Bank Account") (initialBalanceStr.toDoubleOrNull() ?: 0.0) else 0.0
+                    val initialBalance = when (type) {
+                        "Bank Account" -> openingBalanceForCurrentBalance(
+                            acc.id,
+                            transactions,
+                            initialBalanceStr.toDoubleOrNull() ?: 0.0
+                        )
+                        "Credit Card" -> com.example.utils.TransactionIdentityResolver.creditCardAnchorForOutstanding(
+                            outstanding,
+                            transactions,
+                            null,
+                            acc.id,
+                            digits.trim()
+                        )
+                        else -> 0.0
+                    }
                     viewModel.updateAccount(
                         id = acc.id,
                         name = name.trim(),
@@ -2958,13 +3018,9 @@ fun EditAccountDialog(
 fun calculateAccountBalance(accountId: String, transactions: List<TransactionEntity>, initialBalance: Double): Double {
     var balance = initialBalance
     transactions.forEach { tx ->
-        val isInternal = tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER"
-        if (isInternal) {
-            if (tx.accountId == accountId) {
-                balance -= tx.amount
-            } else if (tx.counterpartyAccountId == accountId) {
-                balance += tx.amount
-            }
+        val transferEffect = TransactionIdentityResolver.internalTransferBalanceEffect(tx, accountId, transactions)
+        if (transferEffect != null) {
+            balance += transferEffect
         } else {
             val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
             val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
@@ -2974,6 +3030,12 @@ fun calculateAccountBalance(accountId: String, transactions: List<TransactionEnt
             } else if (tx.counterpartyAccountId == accountId) {
                 balance += tx.amount
             }
+
+            fun openingBalanceForCurrentBalance(
+                accountId: String,
+                transactions: List<TransactionEntity>,
+                currentBalance: Double
+            ): Double = currentBalance - calculateAccountBalance(accountId, transactions, 0.0)
         }
     }
     return balance

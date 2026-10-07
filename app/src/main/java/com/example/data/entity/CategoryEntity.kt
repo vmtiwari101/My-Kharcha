@@ -1,11 +1,10 @@
 package com.example.data.entity
 
 import androidx.room.Entity
-import androidx.room.PrimaryKey
 
-@Entity(tableName = "categories")
+@Entity(tableName = "categories", primaryKeys = ["userId", "id"])
 data class CategoryEntity(
-    @PrimaryKey val id: String,
+    val id: String,
     val name: String,
     val nameHindi: String = "",
     val icon: String,
@@ -14,5 +13,6 @@ data class CategoryEntity(
     val isActive: Boolean = true,
     val isIncome: Boolean = false,
     val createdAt: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val userId: String = ""
 )

@@ -502,13 +502,18 @@ object TransactionIdentityResolver {
      * Checks if a transaction is a credit card bill payment or refund.
      */
     fun isCreditCardPaymentOrRefund(tx: TransactionEntity, cardId: String?, accountId: String, last4: String): Boolean {
-        val isPaymentIdentifier = tx.transactionType == "CARD_PAYMENT" || tx.merchant.contains("Credit Card Bill Payment", true) ||
+        val isPaymentIdentifier = tx.transactionType == "CARD_PAYMENT" ||
+                tx.transactionType == "CREDIT_CARD_BILL_PAYMENT" ||
+                tx.merchant.contains("Credit Card Bill Payment", true) ||
                 tx.note.contains("credit card payment", true) || tx.note.contains("cc payment", true) ||
                 tx.note.contains("payment received towards your credit card", true) || tx.note.contains("paid towards credit card", true)
 
         if (isPaymentIdentifier) {
             if (accountId.isNotEmpty() && tx.counterpartyAccountId == accountId) return true
             if (cardId != null && tx.counterpartyAccountId == cardId) return true
+            if (tx.isInternalTransfer || tx.transactionType == "CARD_PAYMENT" ||
+                tx.transactionType == "CREDIT_CARD_BILL_PAYMENT"
+            ) return false
             if (accountId.isNotEmpty() && tx.accountId == accountId) return true
             if (last4.length == 4 && tx.last4Digits == last4) return true
         }
@@ -522,8 +527,74 @@ object TransactionIdentityResolver {
                 return text.contains("refund") || text.contains("cashback") || text.contains("reversal") || text.contains("credit card")
             }
         }
-
         return false
+    }
+
+    fun creditCardTransactionNet(
+        transactions: List<TransactionEntity>,
+        cardId: String?,
+        accountId: String,
+        last4: String
+    ): Double {
+        val purchases = transactions
+            .filter { isCreditCardPurchase(it, cardId, accountId, last4) }
+            .sumOf { it.amount }
+        val paymentsAndRefunds = transactions
+            .filter { isCreditCardPaymentOrRefund(it, cardId, accountId, last4) }
+            .sumOf { it.amount }
+        return purchases - paymentsAndRefunds
+    }
+
+    fun creditCardOutstandingFromAnchor(
+        initialOutstanding: Double,
+        transactions: List<TransactionEntity>,
+        cardId: String?,
+        accountId: String,
+        last4: String
+    ): Double = (initialOutstanding + creditCardTransactionNet(transactions, cardId, accountId, last4))
+        .coerceAtLeast(0.0)
+
+    fun creditCardAnchorForOutstanding(
+        currentOutstanding: Double,
+        transactions: List<TransactionEntity>,
+        cardId: String?,
+        accountId: String,
+        last4: String
+    ): Double = currentOutstanding - creditCardTransactionNet(transactions, cardId, accountId, last4)
+
+    fun internalTransferBalanceEffect(
+        tx: TransactionEntity,
+        accountId: String,
+        transactions: List<TransactionEntity>
+    ): Double? {
+        val isInternal = tx.isInternalTransfer ||
+            tx.type == "INTERNAL_TRANSFER" ||
+            tx.transactionType == "INTERNAL_TRANSFER" ||
+            tx.transactionType == "CARD_PAYMENT" ||
+            tx.transactionType == "CREDIT_CARD_BILL_PAYMENT"
+        if (!isInternal) return null
+
+        val hasLinkedSide = !tx.transferGroupId.isNullOrBlank() &&
+            !tx.counterpartyAccountId.isNullOrBlank() &&
+            transactions.any { peer ->
+                peer.id != tx.id &&
+                    peer.userId == tx.userId &&
+                    peer.transferGroupId == tx.transferGroupId &&
+                    peer.accountId == tx.counterpartyAccountId &&
+                    peer.counterpartyAccountId == tx.accountId &&
+                    peer.direction != tx.direction &&
+                    kotlin.math.abs(peer.amount - tx.amount) < 0.01
+            }
+        if (hasLinkedSide) {
+            if (tx.accountId != accountId) return 0.0
+            return if (tx.direction.equals("CREDIT", true)) tx.amount else -tx.amount
+        }
+        return when {
+            tx.accountId == accountId ->
+                if (tx.direction.equals("CREDIT", true) || tx.type == "INCOME") tx.amount else -tx.amount
+            tx.counterpartyAccountId == accountId -> tx.amount
+            else -> 0.0
+        }
     }
 
     /**

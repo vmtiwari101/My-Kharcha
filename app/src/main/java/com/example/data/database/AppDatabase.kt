@@ -26,7 +26,7 @@ import kotlinx.coroutines.launch
         AccountEntity::class,
         CardEntity::class
     ],
-    version = 9,
+    version = 11,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -239,14 +239,6 @@ abstract class AppDatabase : RoomDatabase() {
 
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                // Update incorrect IDFC 2137 account type to Credit Card
-                db.execSQL(
-                    """
-                    UPDATE accounts 
-                    SET type = 'Credit Card' 
-                    WHERE bankName = 'IDFC FIRST Bank' AND last4Digits = '2137'
-                    """
-                )
             }
         }
 
@@ -310,6 +302,107 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val legacyOwner = "legacy:unassigned"
+
+                fun migrateTable(oldName: String, newName: String, createSql: String, selectColumns: String, columnOrder: List<String>) {
+                    val tableExists = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='${oldName}'").use { cursor ->
+                        cursor.moveToFirst() && cursor.count > 0
+                    }
+
+                    if (!tableExists) return
+
+                    db.execSQL("ALTER TABLE `${oldName}` RENAME TO `${newName}`;")
+                    db.execSQL("CREATE TABLE `${oldName}` (${createSql})")
+                    db.execSQL(
+                        "INSERT INTO `${oldName}` (${columnOrder.joinToString(", ")}) SELECT ${selectColumns} FROM `${newName}`;"
+                    )
+                    db.execSQL("DROP TABLE `${newName}`;")
+                }
+
+                val accountCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `name` TEXT NOT NULL, `type` TEXT NOT NULL, `bankName` TEXT NOT NULL DEFAULT '', `last4Digits` TEXT NOT NULL DEFAULT '', `icon` TEXT NOT NULL DEFAULT 'landmark', `colour` TEXT NOT NULL DEFAULT '#1E40AF', `isActive` INTEGER NOT NULL DEFAULT 1, `isDefault` INTEGER NOT NULL DEFAULT 0, `isOwnedByMe` INTEGER NOT NULL DEFAULT 1, `createdAt` TEXT NOT NULL DEFAULT '', `updatedAt` TEXT NOT NULL DEFAULT '', `creditLimit` REAL NOT NULL DEFAULT 0.0, `outstandingAmount` REAL NOT NULL DEFAULT 0.0, `billingDate` INTEGER NOT NULL DEFAULT 0, `dueDate` INTEGER NOT NULL DEFAULT 0, `initialBalance` REAL NOT NULL DEFAULT 0.0, `minimumAmountDue` REAL NOT NULL DEFAULT 0.0, `paymentDueDate` TEXT NOT NULL DEFAULT '', `statementDate` TEXT NOT NULL DEFAULT '', `lastBillSource` TEXT NOT NULL DEFAULT '', `lastBillMessageId` TEXT NOT NULL DEFAULT '', `lastBillUpdatedAt` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`userId`, `id`))"
+                val cardCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `accountId` TEXT NOT NULL, `name` TEXT NOT NULL, `type` TEXT NOT NULL, `last4Digits` TEXT NOT NULL, `createdAt` TEXT NOT NULL DEFAULT '', `updatedAt` TEXT NOT NULL DEFAULT '', `creditLimit` REAL NOT NULL DEFAULT 0.0, `outstandingAmount` REAL NOT NULL DEFAULT 0.0, `billingDate` INTEGER NOT NULL DEFAULT 0, `dueDate` INTEGER NOT NULL DEFAULT 0, `minimumAmountDue` REAL NOT NULL DEFAULT 0.0, `paymentDueDate` TEXT NOT NULL DEFAULT '', `statementDate` TEXT NOT NULL DEFAULT '', `lastBillSource` TEXT NOT NULL DEFAULT '', `lastBillMessageId` TEXT NOT NULL DEFAULT '', `lastBillUpdatedAt` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`userId`, `id`))"
+                val categoryCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `name` TEXT NOT NULL, `nameHindi` TEXT NOT NULL DEFAULT '', `icon` TEXT NOT NULL, `colour` TEXT NOT NULL, `isDefault` INTEGER NOT NULL DEFAULT 0, `isActive` INTEGER NOT NULL DEFAULT 1, `isIncome` INTEGER NOT NULL DEFAULT 0, `createdAt` TEXT NOT NULL, `updatedAt` TEXT NOT NULL, PRIMARY KEY(`userId`, `id`))"
+                val subcategoryCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `categoryId` TEXT NOT NULL, `name` TEXT NOT NULL, `nameHindi` TEXT NOT NULL DEFAULT '', `icon` TEXT NOT NULL, `colour` TEXT NOT NULL, `isDefault` INTEGER NOT NULL DEFAULT 0, `isActive` INTEGER NOT NULL DEFAULT 1, `createdAt` TEXT NOT NULL, `updatedAt` TEXT NOT NULL, PRIMARY KEY(`userId`, `id`))"
+                val transactionCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `type` TEXT NOT NULL, `amount` REAL NOT NULL, `date` TEXT NOT NULL, `time` TEXT NOT NULL, `merchant` TEXT NOT NULL, `categoryId` TEXT NOT NULL, `subcategoryId` TEXT NOT NULL, `accountId` TEXT NOT NULL, `paymentMethod` TEXT NOT NULL, `note` TEXT NOT NULL, `source` TEXT NOT NULL DEFAULT 'MANUAL', `transactionReference` TEXT NOT NULL DEFAULT '', `originalReference` TEXT NOT NULL DEFAULT '', `last4Digits` TEXT NOT NULL DEFAULT '', `createdAt` TEXT NOT NULL DEFAULT '', `updatedAt` TEXT NOT NULL DEFAULT '', `transactionId` TEXT, `cardId` TEXT, `transactionType` TEXT, `direction` TEXT, `referenceId` TEXT, `transferGroupId` TEXT, `counterpartyAccountId` TEXT, `last4` TEXT, `duplicateFingerprint` TEXT, `isInternalTransfer` INTEGER NOT NULL DEFAULT 0, `needsReview` INTEGER NOT NULL DEFAULT 0, `isExpense` INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(`userId`, `id`))"
+                val splitCreate = "`userId` TEXT NOT NULL DEFAULT '${legacyOwner}', `id` TEXT NOT NULL, `transactionId` TEXT NOT NULL, `categoryId` TEXT NOT NULL, `subcategoryId` TEXT NOT NULL DEFAULT '', `amount` REAL NOT NULL, `note` TEXT NOT NULL DEFAULT '', `createdAt` TEXT NOT NULL, `updatedAt` TEXT NOT NULL, PRIMARY KEY(`userId`, `id`), FOREIGN KEY(`userId`, `transactionId`) REFERENCES `transactions`(`userId`, `id`) ON DELETE CASCADE)"
+
+                fun renameAddUserId(oldName: String, createSql: String, selectCols: String, columns: List<String>) {
+                    val tempName = "${oldName}_v10_tmp"
+                    db.execSQL("ALTER TABLE `$oldName` RENAME TO `$tempName`")
+                    db.execSQL("CREATE TABLE `$oldName` ($createSql)")
+                    db.execSQL("INSERT INTO `$oldName` (${columns.joinToString(", ")}) SELECT ${selectCols} FROM `$tempName`")
+                    db.execSQL("DROP TABLE `$tempName`")
+                }
+
+                renameAddUserId(
+                    "accounts",
+                    accountCreate,
+                    "`id`, `name`, `type`, `bankName`, `last4Digits`, `icon`, `colour`, `isActive`, `isDefault`, `isOwnedByMe`, `createdAt`, `updatedAt`, `creditLimit`, `outstandingAmount`, `billingDate`, `dueDate`, `initialBalance`, `minimumAmountDue`, `paymentDueDate`, `statementDate`, `lastBillSource`, `lastBillMessageId`, `lastBillUpdatedAt`, '${legacyOwner}'",
+                    listOf("userId","id","name","type","bankName","last4Digits","icon","colour","isActive","isDefault","isOwnedByMe","createdAt","updatedAt","creditLimit","outstandingAmount","billingDate","dueDate","initialBalance","minimumAmountDue","paymentDueDate","statementDate","lastBillSource","lastBillMessageId","lastBillUpdatedAt")
+                )
+                renameAddUserId(
+                    "cards",
+                    cardCreate,
+                    "`id`, `accountId`, `name`, `type`, `last4Digits`, `createdAt`, `updatedAt`, `creditLimit`, `outstandingAmount`, `billingDate`, `dueDate`, `minimumAmountDue`, `paymentDueDate`, `statementDate`, `lastBillSource`, `lastBillMessageId`, `lastBillUpdatedAt`, '${legacyOwner}'",
+                    listOf("userId","id","accountId","name","type","last4Digits","createdAt","updatedAt","creditLimit","outstandingAmount","billingDate","dueDate","minimumAmountDue","paymentDueDate","statementDate","lastBillSource","lastBillMessageId","lastBillUpdatedAt")
+                )
+                renameAddUserId(
+                    "categories",
+                    categoryCreate,
+                    "`id`, `name`, `nameHindi`, `icon`, `colour`, `isDefault`, `isActive`, `isIncome`, `createdAt`, `updatedAt`, '${legacyOwner}'",
+                    listOf("userId","id","name","nameHindi","icon","colour","isDefault","isActive","isIncome","createdAt","updatedAt")
+                )
+                renameAddUserId(
+                    "subcategories",
+                    subcategoryCreate,
+                    "`id`, `categoryId`, `name`, `nameHindi`, `icon`, `colour`, `isDefault`, `isActive`, `createdAt`, `updatedAt`, '${legacyOwner}'",
+                    listOf("userId","id","categoryId","name","nameHindi","icon","colour","isDefault","isActive","createdAt","updatedAt")
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE `transaction_splits_v10_data` AS
+                    SELECT `id`, `transactionId`, `categoryId`, `subcategoryId`, `amount`, `note`, `createdAt`, `updatedAt`
+                    FROM `transaction_splits`
+                    """.trimIndent()
+                )
+                db.execSQL("DROP TABLE `transaction_splits`")
+
+                renameAddUserId(
+                    "transactions",
+                    transactionCreate,
+                    "`id`, `type`, `amount`, `date`, `time`, `merchant`, `categoryId`, `subcategoryId`, `accountId`, `paymentMethod`, `note`, `source`, `transactionReference`, `originalReference`, `last4Digits`, `createdAt`, `updatedAt`, `transactionId`, `cardId`, `transactionType`, `direction`, `referenceId`, `transferGroupId`, `counterpartyAccountId`, `last4`, `duplicateFingerprint`, `isInternalTransfer`, `needsReview`, `isExpense`, '${legacyOwner}'",
+                    listOf("userId","id","type","amount","date","time","merchant","categoryId","subcategoryId","accountId","paymentMethod","note","source","transactionReference","originalReference","last4Digits","createdAt","updatedAt","transactionId","cardId","transactionType","direction","referenceId","transferGroupId","counterpartyAccountId","last4","duplicateFingerprint","isInternalTransfer","needsReview","isExpense")
+                )
+
+                db.execSQL("CREATE TABLE `transaction_splits` ($splitCreate)")
+                db.execSQL(
+                    """
+                    INSERT INTO `transaction_splits`
+                        (`userId`, `id`, `transactionId`, `categoryId`, `subcategoryId`, `amount`, `note`, `createdAt`, `updatedAt`)
+                    SELECT
+                        '${legacyOwner}', `id`, `transactionId`, `categoryId`, `subcategoryId`, `amount`, `note`, `createdAt`, `updatedAt`
+                    FROM `transaction_splits_v10_data`
+                    """.trimIndent()
+                )
+                db.execSQL("DROP TABLE `transaction_splits_v10_data`")
+
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_transaction_splits_userId_transactionId ON `transaction_splits` (`userId`, `transactionId`)")
+            }
+        }
+
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                ensureColumnsExist(
+                    db,
+                    "transactions",
+                    listOf(Triple("cardPaymentBalanceApplied", "INTEGER", "0"))
+                )
+            }
+        }
+
         @Volatile
         private var TEST_INSTANCE: AppDatabase? = null
         
@@ -325,7 +418,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "kharcha_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
                     .build()
                 INSTANCE = instance
                 instance
@@ -333,8 +426,10 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         suspend fun prepopulateData(dao: KharchaDao) {
-            com.example.data.DefaultCategoryData.defaultCategories.forEach { dao.insertCategory(it) }
-            com.example.data.DefaultCategoryData.defaultSubcategories.forEach { dao.insertSubcategory(it) }
+            com.example.data.DefaultCategoryData.restoreAndExpandCategoriesAndSubcategories(
+                dao,
+                ensureCashAccount = false
+            )
         }
     }
 }

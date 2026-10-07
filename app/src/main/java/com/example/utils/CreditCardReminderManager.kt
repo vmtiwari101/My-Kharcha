@@ -12,6 +12,7 @@ import com.example.data.database.AppDatabase
 import com.example.data.entity.AccountEntity
 import com.example.data.entity.CardEntity
 import com.example.receiver.CreditCardReminderReceiver
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,6 +29,7 @@ import kotlin.math.abs
 object CreditCardReminderManager {
 
     private const val TAG = "CCReminderManager"
+    private const val LEGACY_OWNER = "legacy:unassigned"
     const val PREFS_NAME = "credit_card_reminders_pref"
     const val CHANNEL_ID = "credit_card_due_reminders"
     const val CHANNEL_NAME = "Credit Card Bill Reminders"
@@ -35,19 +37,40 @@ object CreditCardReminderManager {
     // Supported reminder offsets (in days before due date)
     val DEFAULT_OFFSETS = setOf(7, 3, 1, 0)
 
+    @Volatile
+    internal var liveAuthenticatedUidProvider: () -> String? = {
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase authentication is unavailable", e)
+            null
+        }
+    }
+
+    internal fun liveAuthenticatedUid(): String? =
+        liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+    internal fun isScheduledOwnerValid(currentUid: String?, scheduledUid: String?): Boolean =
+        !currentUid.isNullOrBlank() && currentUid != LEGACY_OWNER && currentUid == scheduledUid
+
+    private fun userCardKey(owner: String, cardKey: String): String = "${owner}_$cardKey"
+
     fun isReminderEnabledForCard(context: Context, cardKey: String): Boolean {
+        val owner = liveAuthenticatedUid() ?: return false
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getBoolean("enabled_$cardKey", true)
+        return prefs.getBoolean("enabled_${userCardKey(owner, cardKey)}", true)
     }
 
     fun setReminderEnabledForCard(context: Context, cardKey: String, enabled: Boolean) {
+        val owner = liveAuthenticatedUid() ?: return
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putBoolean("enabled_$cardKey", enabled).apply()
+        prefs.edit().putBoolean("enabled_${userCardKey(owner, cardKey)}", enabled).apply()
     }
 
     fun getEnabledOffsetsForCard(context: Context, cardKey: String): Set<Int> {
+        val owner = liveAuthenticatedUid() ?: return emptySet()
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val strSet = prefs.getStringSet("offsets_$cardKey", null)
+        val strSet = prefs.getStringSet("offsets_${userCardKey(owner, cardKey)}", null)
         return if (strSet != null) {
             strSet.mapNotNull { it.toIntOrNull() }.toSet()
         } else {
@@ -56,9 +79,10 @@ object CreditCardReminderManager {
     }
 
     fun setEnabledOffsetsForCard(context: Context, cardKey: String, offsets: Set<Int>) {
+        val owner = liveAuthenticatedUid() ?: return
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val strSet = offsets.map { it.toString() }.toSet()
-        prefs.edit().putStringSet("offsets_$cardKey", strSet).apply()
+        prefs.edit().putStringSet("offsets_${userCardKey(owner, cardKey)}", strSet).apply()
     }
 
     fun getCardKey(bankName: String, last4: String): String {
@@ -116,6 +140,23 @@ object CreditCardReminderManager {
         accountId: String,
         outstandingAmount: Double
     ) {
+        val owner = liveAuthenticatedUid() ?: run {
+            Log.w(TAG, "Reminder scheduling rejected because no live authenticated user is available")
+            return
+        }
+        scheduleRemindersForOwner(context, owner, bankName, last4, dueDate, accountId, outstandingAmount)
+    }
+
+    internal fun scheduleRemindersForOwner(
+        context: Context,
+        owner: String,
+        bankName: String,
+        last4: String,
+        dueDate: Int,
+        accountId: String,
+        outstandingAmount: Double
+    ) {
+        if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
         if (dueDate !in 1..31) {
             Log.d(TAG, "Skipping reminders for $bankName ($last4): invalid due date ($dueDate)")
             return
@@ -123,29 +164,32 @@ object CreditCardReminderManager {
 
         if (outstandingAmount <= 0.0) {
             Log.d(TAG, "Skipping reminders for $bankName ($last4): outstanding is zero or negative (₹$outstandingAmount)")
-            cancelRemindersForCard(context, bankName, last4, dueDate)
+            cancelRemindersForOwner(context, owner, bankName, last4, dueDate)
             return
         }
 
         val cardKey = getCardKey(bankName, last4)
-        if (!isReminderEnabledForCard(context, cardKey)) {
+        if (!isReminderEnabledForOwner(context, owner, cardKey)) {
             Log.d(TAG, "Skipping reminders for $bankName ($last4): reminders disabled by user")
-            cancelRemindersForCard(context, bankName, last4, dueDate)
+            cancelRemindersForOwner(context, owner, bankName, last4, dueDate)
             return
         }
 
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-        val enabledOffsets = getEnabledOffsetsForCard(context, cardKey)
+        val enabledOffsets = getEnabledOffsetsForOwner(context, owner, cardKey)
+        val alarmCardKey = userCardKey(owner, cardKey)
 
         createNotificationChannel(context)
 
         for (offset in enabledOffsets) {
+            if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
             val triggerTime = calculateNextReminderTime(dueDate, offset) ?: continue
-            val requestCode = getRequestCode(cardKey, dueDate, offset)
+            val requestCode = getRequestCode(alarmCardKey, dueDate, offset)
 
             val intent = Intent(context, CreditCardReminderReceiver::class.java).apply {
                 action = CreditCardReminderReceiver.ACTION_CREDIT_CARD_DUE_REMINDER
                 putExtra(CreditCardReminderReceiver.EXTRA_CARD_KEY, cardKey)
+                putExtra(CreditCardReminderReceiver.EXTRA_OWNER_UID, owner)
                 putExtra(CreditCardReminderReceiver.EXTRA_BANK_NAME, bankName)
                 putExtra(CreditCardReminderReceiver.EXTRA_LAST4, last4)
                 putExtra(CreditCardReminderReceiver.EXTRA_DUE_DATE, dueDate)
@@ -180,8 +224,14 @@ object CreditCardReminderManager {
      * Cancels all scheduled reminder alarms for a given card.
      */
     fun cancelRemindersForCard(context: Context, bankName: String, last4: String, dueDate: Int) {
+        val owner = liveAuthenticatedUid() ?: return
+        cancelRemindersForOwner(context, owner, bankName, last4, dueDate)
+    }
+
+    private fun cancelRemindersForOwner(context: Context, owner: String, bankName: String, last4: String, dueDate: Int) {
+        if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-        val cardKey = getCardKey(bankName, last4)
+        val cardKey = userCardKey(owner, getCardKey(bankName, last4))
 
         for (offset in DEFAULT_OFFSETS) {
             val requestCode = getRequestCode(cardKey, dueDate, offset)
@@ -208,12 +258,23 @@ object CreditCardReminderManager {
     fun rescheduleAllAsync(context: Context) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                val owner = liveAuthenticatedUid() ?: return@launch
+                rescheduleAllForOwner(context.applicationContext, owner)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during rescheduleAllAsync: ${e.message}", e)
+            }
+        }
+    }
+
+    internal suspend fun rescheduleAllForOwner(context: Context, owner: String) {
+        if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
+        try {
                 val db = AppDatabase.getDatabase(context)
                 val dao = db.kharchaDao()
 
-                val accounts = dao.getAllAccountsSync()
-                val cards = dao.getAllCardsSync()
-                val transactions = dao.getAllTransactionsSync()
+                val accounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
+                val cards = dao.getAllCardsSyncForUser(owner).filter { it.userId == owner }
+                val transactions = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
 
                 val creditAccounts = accounts.filter { it.isActive && it.type.equals("Credit Card", ignoreCase = true) }
                 val creditCards = cards.filter { it.type.equals("Credit Card", ignoreCase = true) }
@@ -222,6 +283,7 @@ object CreditCardReminderManager {
 
                 // 1. Process CardEntity records
                 for (card in creditCards) {
+                    if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
                     val parentAcc = accounts.find { it.id == card.accountId }
                     val bankName = parentAcc?.bankName?.ifEmpty { parentAcc.name } ?: card.name
                     val last4 = card.last4Digits.ifEmpty { parentAcc?.last4Digits ?: "" }
@@ -236,13 +298,21 @@ object CreditCardReminderManager {
                                 (last4.length == 4 && tx.last4Digits == last4)
                     }
                     val expenseTotal = linkedTxs.filter { (it.direction == "DEBIT" || it.type == "EXPENSE") && !it.isInternalTransfer && it.transactionType != "CARD_PAYMENT" && it.transactionType != "CREDIT_CARD_BILL_PAYMENT" }.sumOf { it.amount }
-                    val paymentTotal = linkedTxs.filter { it.transactionType == "CARD_PAYMENT" || it.transactionType == "CREDIT_CARD_BILL_PAYMENT" || (it.direction == "CREDIT" && !it.isInternalTransfer) }.sumOf { it.amount }
+                    val paymentTotal = linkedTxs.filter {
+                        TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+                            it,
+                            card.id,
+                            card.accountId.ifEmpty { parentAcc?.id.orEmpty() },
+                            last4
+                        )
+                    }.sumOf { it.amount }
                     val txOutstanding = (expenseTotal - paymentTotal).coerceAtLeast(0.0)
                     val effectiveOutstanding = if (txOutstanding > 0.0) txOutstanding else maxOf(parentAcc?.outstandingAmount ?: 0.0, card.outstandingAmount)
 
                     if (dueDate in 1..31 && effectiveOutstanding > 0.0) {
-                        scheduleRemindersForCard(
+                        scheduleRemindersForOwner(
                             context = context,
+                            owner = owner,
                             bankName = bankName,
                             last4 = last4,
                             dueDate = dueDate,
@@ -256,6 +326,7 @@ object CreditCardReminderManager {
 
                 // 2. Process standalone credit card AccountEntity records
                 for (acc in creditAccounts) {
+                    if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return
                     val bankName = acc.bankName.ifEmpty { acc.name }
                     val last4 = acc.last4Digits
                     val dueDate = acc.dueDate
@@ -267,13 +338,16 @@ object CreditCardReminderManager {
                         tx.accountId == acc.id || tx.counterpartyAccountId == acc.id || (last4.length == 4 && tx.last4Digits == last4)
                     }
                     val expenseTotal = linkedTxs.filter { (it.direction == "DEBIT" || it.type == "EXPENSE") && !it.isInternalTransfer && it.transactionType != "CARD_PAYMENT" && it.transactionType != "CREDIT_CARD_BILL_PAYMENT" }.sumOf { it.amount }
-                    val paymentTotal = linkedTxs.filter { it.transactionType == "CARD_PAYMENT" || it.transactionType == "CREDIT_CARD_BILL_PAYMENT" || (it.direction == "CREDIT" && !it.isInternalTransfer) }.sumOf { it.amount }
+                    val paymentTotal = linkedTxs.filter {
+                        TransactionIdentityResolver.isCreditCardPaymentOrRefund(it, null, acc.id, last4)
+                    }.sumOf { it.amount }
                     val txOutstanding = (expenseTotal - paymentTotal).coerceAtLeast(0.0)
                     val effectiveOutstanding = if (txOutstanding > 0.0) txOutstanding else acc.outstandingAmount
 
                     if (dueDate in 1..31 && effectiveOutstanding > 0.0) {
-                        scheduleRemindersForCard(
+                        scheduleRemindersForOwner(
                             context = context,
+                            owner = owner,
                             bankName = bankName,
                             last4 = last4,
                             dueDate = dueDate,
@@ -286,10 +360,22 @@ object CreditCardReminderManager {
                 }
 
                 Log.d(TAG, "Completed full reminders rescheduling for ${processedKeys.size} credit cards")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during rescheduleAllAsync: ${e.message}", e)
-            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during reminder rescheduling: ${e.message}", e)
         }
+    }
+
+    internal fun isReminderEnabledForOwner(context: Context, owner: String, cardKey: String): Boolean {
+        if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return false
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean("enabled_${userCardKey(owner, cardKey)}", true)
+    }
+
+    private fun getEnabledOffsetsForOwner(context: Context, owner: String, cardKey: String): Set<Int> {
+        if (!isScheduledOwnerValid(liveAuthenticatedUid(), owner)) return emptySet()
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val strSet = prefs.getStringSet("offsets_${userCardKey(owner, cardKey)}", null)
+        return strSet?.mapNotNull { it.toIntOrNull() }?.toSet() ?: DEFAULT_OFFSETS
     }
 
     fun createNotificationChannel(context: Context) {

@@ -88,7 +88,11 @@ object NotificationParser {
         val last4 = TransactionIdentityResolver.extractLast4(cleanContent)
         val txRef = extractTransactionReference(cleanContent)
 
-        val originalRef = if (txRef.isNotEmpty()) "NOTIF-REF-$txRef" else "NOTIF-$last4-$amount-$dateStr-$finalType"
+        val originalRef = when {
+            txRef.isNotEmpty() -> "NOTIF-REF-$txRef"
+            postTime > 0L -> "NOTIF-EVENT-$packageName-$postTime"
+            else -> ""
+        }
         val txId = "tx-notif-" + UUID.randomUUID().toString().substring(0, 8)
 
         val categoryId = determineCategory(merchant, finalType, cleanContent)

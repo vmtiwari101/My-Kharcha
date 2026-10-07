@@ -9,6 +9,7 @@ import com.example.data.entity.CategoryEntity
 import com.example.data.entity.SubcategoryEntity
 import com.example.data.entity.TransactionEntity
 import com.example.data.entity.TransactionSplitEntity
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -89,6 +90,19 @@ object KharchaBackupManager {
         }.format(Date())
     }
 
+    private fun authenticatedUserId(): String? = try {
+        FirebaseAuth.getInstance().currentUser?.uid?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) {
+        Log.w(TAG, "Unable to verify authenticated user for backup: ${e.message}", e)
+        null
+    }
+
+    private fun backupRecordBelongsTo(userId: String, record: JSONObject): Boolean {
+        if (!record.has("userId")) return true
+        val recordUserId = record.opt("userId") as? String
+        return recordUserId == userId
+    }
+
     /**
      * Serializes all structured My Kharcha database entities into a versioned JSON string.
      * EXCLUDES raw SMS body text, raw notifications, email tokens, PINs, or credentials.
@@ -98,15 +112,42 @@ object KharchaBackupManager {
         ownerEmail: String,
         userId: String
     ): JSONObject = withContext(Dispatchers.IO) {
+        val authenticatedUserId = authenticatedUserId()
+            ?: throw IllegalStateException("An authenticated user is required to create a backup.")
+        require(userId == authenticatedUserId) {
+            "Backup user ID does not match the authenticated user."
+        }
+
         val db = AppDatabase.getDatabase(context)
         val dao = db.kharchaDao()
 
-        val transactions = dao.getAllTransactionsSync()
-        val accounts = dao.getAllAccountsSync()
-        val cards = dao.getAllCardsSync()
-        val categories = dao.getAllCategoriesSync()
-        val subcategories = dao.getAllSubcategoriesSync()
-        val splits = dao.getAllSplitsSync()
+        val accounts = dao.getAllAccountsSyncForUser(authenticatedUserId)
+            .filter { it.userId == authenticatedUserId }
+        val accountIds = accounts.mapTo(mutableSetOf()) { it.id }
+        val cards = dao.getAllCardsSyncForUser(authenticatedUserId)
+            .filter { it.userId == authenticatedUserId && it.accountId in accountIds }
+        val cardIds = cards.mapTo(mutableSetOf()) { it.id }
+        val categories = dao.getAllCategoriesSyncForUser(authenticatedUserId)
+            .filter { it.userId == authenticatedUserId }
+        val categoryIds = categories.mapTo(mutableSetOf()) { it.id }
+        val subcategories = dao.getAllSubcategoriesSyncForUser(authenticatedUserId)
+            .filter { it.userId == authenticatedUserId && it.categoryId in categoryIds }
+        val subcategoriesById = subcategories.associateBy { it.id }
+        val transactions = dao.getAllTransactionsSyncForUser(authenticatedUserId)
+            .filter { transaction ->
+                transaction.userId == authenticatedUserId &&
+                    (transaction.accountId.isBlank() || transaction.accountId in accountIds) &&
+                    (transaction.categoryId.isBlank() || transaction.categoryId in categoryIds) &&
+                    (transaction.subcategoryId.isBlank() ||
+                        subcategoriesById[transaction.subcategoryId]?.categoryId == transaction.categoryId) &&
+                    (transaction.cardId.isNullOrBlank() || transaction.cardId in cardIds) &&
+                    (transaction.counterpartyAccountId.isNullOrBlank() ||
+                        transaction.counterpartyAccountId in accountIds ||
+                        transaction.counterpartyAccountId in cardIds)
+            }
+        val transactionIds = transactions.mapTo(mutableSetOf()) { it.id }
+        val splits = dao.getAllSplitsSyncForUser(authenticatedUserId)
+            .filter { it.userId == authenticatedUserId && it.transactionId in transactionIds }
 
         val nowIso = getNowIso()
 
@@ -147,6 +188,7 @@ object KharchaBackupManager {
             txObj.put("isInternalTransfer", tx.isInternalTransfer)
             txObj.put("needsReview", tx.needsReview)
             txObj.put("isExpense", tx.isExpense)
+            txObj.put("cardPaymentBalanceApplied", tx.cardPaymentBalanceApplied)
             txArray.put(txObj)
         }
         root.put("transactions", txArray)
@@ -263,6 +305,11 @@ object KharchaBackupManager {
         ownerEmail: String,
         userId: String
     ): Result<BackupMetadata> = withContext(Dispatchers.IO) {
+        val authenticatedUserId = authenticatedUserId()
+            ?: return@withContext Result.failure(Exception("An authenticated user is required to create a backup."))
+        if (userId != authenticatedUserId) {
+            return@withContext Result.failure(Exception("Backup user ID does not match the authenticated user."))
+        }
         _backupStatus.value = BackupStatus.IN_PROGRESS
         try {
             val jsonPayload = createBackupJsonPayload(context, ownerEmail, userId)
@@ -332,6 +379,21 @@ object KharchaBackupManager {
         overwriteLocal: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
+            val authenticatedUser = try {
+                FirebaseAuth.getInstance().currentUser
+            } catch (e: Exception) {
+                Log.w(TAG, "Unable to verify authenticated user for restore: ${e.message}", e)
+                null
+            } ?: return@withContext Result.failure(Exception("An authenticated user is required to restore a backup."))
+            val uid = authenticatedUser.uid.takeIf { it.isNotBlank() }
+                ?: return@withContext Result.failure(Exception("An authenticated user is required to restore a backup."))
+            val authenticatedEmail = authenticatedUser.email.orEmpty()
+            if (currentOwnerEmail.isBlank() ||
+                (authenticatedEmail.isNotBlank() && !currentOwnerEmail.equals(authenticatedEmail, ignoreCase = true))
+            ) {
+                return@withContext Result.failure(Exception("Restore account does not match the authenticated user."))
+            }
+
             val fileId = findBackupFileIdOnDrive(accessToken)
                 ?: return@withContext Result.failure(Exception("No 'My Kharcha' backup file found on Google Drive for this account."))
 
@@ -342,10 +404,13 @@ object KharchaBackupManager {
                 return@withContext Result.failure(Exception("Backup file is corrupted or invalid. Existing local data was preserved."))
             }
 
-            // User Isolation Check
+            val backupUserId = root.optString("userId", "")
+            if (backupUserId != uid) {
+                return@withContext Result.failure(Exception("Security Error: The backup does not belong to the authenticated user."))
+            }
+
             val backupOwner = root.optString("ownerEmail", "")
-            if (backupOwner.isNotEmpty() && currentOwnerEmail.isNotEmpty() &&
-                !backupOwner.equals(currentOwnerEmail, ignoreCase = true)) {
+            if (backupOwner.isNotEmpty() && !backupOwner.equals(currentOwnerEmail, ignoreCase = true)) {
                 return@withContext Result.failure(Exception("Security Error: The backup belongs to '$backupOwner' and cannot be restored under '$currentOwnerEmail'."))
             }
 
@@ -359,8 +424,14 @@ object KharchaBackupManager {
 
             // 1. Categories & Subcategories
             val categoriesArr = root.optJSONArray("categories") ?: JSONArray()
+            val restoredCategoryIds = dao.getAllCategoriesSyncForUser(uid)
+                .mapTo(mutableSetOf()) { it.id }
             for (i in 0 until categoriesArr.length()) {
                 val catObj = categoriesArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, catObj)) {
+                    Log.w(TAG, "Skipping category with mismatched backup owner")
+                    continue
+                }
                 val cat = CategoryEntity(
                     id = catObj.getString("id"),
                     name = catObj.getString("name"),
@@ -371,18 +442,29 @@ object KharchaBackupManager {
                     isActive = catObj.optBoolean("isActive", true),
                     isIncome = catObj.optBoolean("isIncome", false),
                     createdAt = catObj.optString("createdAt", getNowIso()),
-                    updatedAt = catObj.optString("updatedAt", getNowIso())
+                    updatedAt = catObj.optString("updatedAt", getNowIso()),
+                    userId = uid
                 )
                 dao.insertCategory(cat)
+                restoredCategoryIds.add(cat.id)
                 restoredCatCount++
             }
 
             val subcategoriesArr = root.optJSONArray("subcategories") ?: JSONArray()
             for (i in 0 until subcategoriesArr.length()) {
                 val subObj = subcategoriesArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, subObj)) {
+                    Log.w(TAG, "Skipping subcategory with mismatched backup owner")
+                    continue
+                }
+                val categoryId = subObj.optString("categoryId", "")
+                if (categoryId !in restoredCategoryIds) {
+                    Log.w(TAG, "Skipping subcategory with missing owner-scoped category")
+                    continue
+                }
                 val sub = SubcategoryEntity(
                     id = subObj.getString("id"),
-                    categoryId = subObj.getString("categoryId"),
+                    categoryId = categoryId,
                     name = subObj.getString("name"),
                     nameHindi = subObj.optString("nameHindi", ""),
                     icon = subObj.optString("icon", "grid"),
@@ -390,16 +472,22 @@ object KharchaBackupManager {
                     isDefault = subObj.optBoolean("isDefault", false),
                     isActive = subObj.optBoolean("isActive", true),
                     createdAt = subObj.optString("createdAt", getNowIso()),
-                    updatedAt = subObj.optString("updatedAt", getNowIso())
+                    updatedAt = subObj.optString("updatedAt", getNowIso()),
+                    userId = uid
                 )
                 dao.insertSubcategory(sub)
             }
 
             // 2. Accounts & Cards
             val accountsArr = root.optJSONArray("accounts") ?: JSONArray()
-            val existingAccounts = dao.getAllAccountsSync()
+            val existingAccounts = dao.getAllAccountsSyncForUser(uid).toMutableList()
+            val accountIdMap = mutableMapOf<String, String>()
             for (i in 0 until accountsArr.length()) {
                 val accObj = accountsArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, accObj)) {
+                    Log.w(TAG, "Skipping account with mismatched backup owner")
+                    continue
+                }
                 val accId = accObj.getString("id")
                 val acc = AccountEntity(
                     id = accId,
@@ -421,24 +509,48 @@ object KharchaBackupManager {
                     paymentDueDate = accObj.optString("paymentDueDate", ""),
                     statementDate = accObj.optString("statementDate", ""),
                     createdAt = accObj.optString("createdAt", getNowIso()),
-                    updatedAt = accObj.optString("updatedAt", getNowIso())
+                    updatedAt = accObj.optString("updatedAt", getNowIso()),
+                    userId = uid
                 )
                 
-                val exists = existingAccounts.any { it.id == accId || (it.last4Digits == acc.last4Digits && it.last4Digits.length == 4 && it.bankName == acc.bankName && acc.bankName.isNotEmpty()) }
-                if (!exists || overwriteLocal) {
+                val existingById = existingAccounts.find { it.id == accId }
+                val duplicateAccount = existingById ?: existingAccounts.find {
+                    it.last4Digits == acc.last4Digits &&
+                        it.last4Digits.length == 4 &&
+                        it.bankName == acc.bankName &&
+                        acc.bankName.isNotEmpty()
+                }
+                if (duplicateAccount == null || overwriteLocal) {
                     dao.insertAccount(acc)
+                    existingAccounts.removeAll { it.id == acc.id }
+                    existingAccounts.add(acc)
+                    accountIdMap[accId] = acc.id
                     restoredAccCount++
+                } else {
+                    accountIdMap[accId] = duplicateAccount.id
                 }
             }
 
             val cardsArr = root.optJSONArray("cards") ?: JSONArray()
-            val existingCards = dao.getAllCardsSync()
+            val accountIds = dao.getAllAccountsSyncForUser(uid).mapTo(mutableSetOf()) { it.id }
+            val existingCards = dao.getAllCardsSyncForUser(uid).toMutableList()
+            val cardIdMap = mutableMapOf<String, String>()
             for (i in 0 until cardsArr.length()) {
                 val cardObj = cardsArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, cardObj)) {
+                    Log.w(TAG, "Skipping card with mismatched backup owner")
+                    continue
+                }
+                val backupAccountId = cardObj.optString("accountId", "")
+                val accountId = accountIdMap[backupAccountId] ?: backupAccountId
+                if (accountId !in accountIds || accountId == "legacy:unassigned") {
+                    Log.w(TAG, "Skipping card with missing owner-scoped account")
+                    continue
+                }
                 val cardId = cardObj.getString("id")
                 val card = CardEntity(
                     id = cardId,
-                    accountId = cardObj.getString("accountId"),
+                    accountId = accountId,
                     name = cardObj.getString("name"),
                     type = cardObj.optString("type", "Credit Card"),
                     last4Digits = cardObj.optString("last4Digits", ""),
@@ -450,22 +562,59 @@ object KharchaBackupManager {
                     paymentDueDate = cardObj.optString("paymentDueDate", ""),
                     statementDate = cardObj.optString("statementDate", ""),
                     createdAt = cardObj.optString("createdAt", getNowIso()),
-                    updatedAt = cardObj.optString("updatedAt", getNowIso())
+                    updatedAt = cardObj.optString("updatedAt", getNowIso()),
+                    userId = uid
                 )
 
-                val exists = existingCards.any { it.id == cardId || (it.last4Digits == card.last4Digits && it.last4Digits.length == 4) }
-                if (!exists || overwriteLocal) {
+                val existingById = existingCards.find { it.id == cardId }
+                val duplicateCard = existingById ?: existingCards.find {
+                    it.last4Digits == card.last4Digits && it.last4Digits.length == 4
+                }
+                if (duplicateCard == null || overwriteLocal) {
                     dao.insertCard(card)
+                    existingCards.removeAll { it.id == card.id }
+                    existingCards.add(card)
+                    cardIdMap[cardId] = card.id
                     restoredCardCount++
+                } else {
+                    cardIdMap[cardId] = duplicateCard.id
                 }
             }
 
             // 3. Transactions with Deduplication
             val txArr = root.optJSONArray("transactions") ?: JSONArray()
-            val existingTxs = dao.getAllTransactionsSync()
+            val existingTxs = dao.getAllTransactionsSyncForUser(uid).toMutableList()
+            val ownedAccountIds = dao.getAllAccountsSyncForUser(uid).mapTo(mutableSetOf()) { it.id }
+            val ownedCardIds = dao.getAllCardsSyncForUser(uid).mapTo(mutableSetOf()) { it.id }
+            val ownedCategoryIds = dao.getAllCategoriesSyncForUser(uid).mapTo(mutableSetOf()) { it.id }
+            val ownedSubcategories = dao.getAllSubcategoriesSyncForUser(uid).associateBy { it.id }
+            val transactionIdMap = mutableMapOf<String, String>()
             for (i in 0 until txArr.length()) {
                 val txObj = txArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, txObj)) {
+                    Log.w(TAG, "Skipping transaction with mismatched backup owner")
+                    continue
+                }
                 val txId = txObj.getString("id")
+                val backupAccountId = txObj.optString("accountId", "")
+                val accountId = accountIdMap[backupAccountId] ?: backupAccountId
+                val categoryId = txObj.optString("categoryId", "cat-other")
+                val subcategoryId = txObj.optString("subcategoryId", "")
+                val backupCardId = if (txObj.isNull("cardId")) null else txObj.optString("cardId")
+                val cardId = backupCardId?.let { cardIdMap[it] ?: it }
+                val backupCounterpartyId = if (txObj.isNull("counterpartyAccountId")) null else txObj.optString("counterpartyAccountId")
+                val counterpartyId = backupCounterpartyId?.let { accountIdMap[it] ?: cardIdMap[it] ?: it }
+                if ((accountId.isNotBlank() && (accountId == "legacy:unassigned" || accountId !in ownedAccountIds)) ||
+                    (categoryId.isNotBlank() && categoryId !in ownedCategoryIds) ||
+                    (subcategoryId.isNotBlank() &&
+                        ownedSubcategories[subcategoryId]?.categoryId != categoryId) ||
+                    (!cardId.isNullOrBlank() && cardId !in ownedCardIds) ||
+                    (!counterpartyId.isNullOrBlank() &&
+                        counterpartyId !in ownedAccountIds && counterpartyId !in ownedCardIds)
+                ) {
+                    Log.w(TAG, "Skipping transaction $txId with missing owner-scoped relationship")
+                    continue
+                }
                 val tx = TransactionEntity(
                     id = txId,
                     type = txObj.getString("type"),
@@ -473,9 +622,9 @@ object KharchaBackupManager {
                     date = txObj.getString("date"),
                     time = txObj.optString("time", "12:00"),
                     merchant = txObj.optString("merchant", "Unknown Merchant"),
-                    categoryId = txObj.optString("categoryId", "cat-other"),
-                    subcategoryId = txObj.optString("subcategoryId", ""),
-                    accountId = txObj.optString("accountId", ""),
+                    categoryId = categoryId,
+                    subcategoryId = subcategoryId,
+                    accountId = accountId,
                     paymentMethod = txObj.optString("paymentMethod", "Other"),
                     note = txObj.optString("note", ""),
                     source = txObj.optString("source", "RESTORE"),
@@ -484,14 +633,16 @@ object KharchaBackupManager {
                     last4Digits = txObj.optString("last4Digits", ""),
                     createdAt = txObj.optString("createdAt", getNowIso()),
                     updatedAt = txObj.optString("updatedAt", getNowIso()),
-                    cardId = if (txObj.isNull("cardId")) null else txObj.optString("cardId"),
+                    cardId = cardId,
                     transactionType = if (txObj.isNull("transactionType")) null else txObj.optString("transactionType"),
                     direction = if (txObj.isNull("direction")) null else txObj.optString("direction"),
                     transferGroupId = if (txObj.isNull("transferGroupId")) null else txObj.optString("transferGroupId"),
-                    counterpartyAccountId = if (txObj.isNull("counterpartyAccountId")) null else txObj.optString("counterpartyAccountId"),
+                    counterpartyAccountId = counterpartyId,
                     isInternalTransfer = txObj.optBoolean("isInternalTransfer", false),
                     needsReview = txObj.optBoolean("needsReview", false),
-                    isExpense = txObj.optBoolean("isExpense", true)
+                    isExpense = txObj.optBoolean("isExpense", true),
+                    cardPaymentBalanceApplied = txObj.optBoolean("cardPaymentBalanceApplied", false),
+                    userId = uid
                 )
 
                 val isDuplicate = existingTxs.any { existing ->
@@ -500,7 +651,54 @@ object KharchaBackupManager {
 
                 if (!isDuplicate || overwriteLocal) {
                     dao.insertTransaction(tx)
+                    existingTxs.removeAll { it.id == tx.id }
+                    existingTxs.add(tx)
+                    transactionIdMap[txId] = tx.id
                     restoredTxCount++
+                } else {
+                    transactionIdMap[txId] = existingTxs.first {
+                        it.id == txId || TransactionIngestionEngine.isDuplicateTransaction(tx, it)
+                    }.id
+                }
+            }
+
+            val splitArr = root.optJSONArray("splits") ?: JSONArray()
+            val ownedTransactions = dao.getAllTransactionsSyncForUser(uid).associateBy { it.id }
+            val existingSplits = dao.getAllSplitsSyncForUser(uid).mapTo(mutableSetOf()) { it.id }
+            for (i in 0 until splitArr.length()) {
+                val splitObj = splitArr.getJSONObject(i)
+                if (!backupRecordBelongsTo(uid, splitObj)) {
+                    Log.w(TAG, "Skipping transaction split with mismatched backup owner")
+                    continue
+                }
+                val backupParentId = splitObj.optString("transactionId", "")
+                val categoryId = splitObj.optString("categoryId", "")
+                val subcategoryId = splitObj.optString("subcategoryId", "")
+                val parentId = transactionIdMap[backupParentId]
+                val parent = parentId?.let { ownedTransactions[it] }
+                if (parent == null || parent.userId != uid ||
+                    (categoryId.isNotBlank() && categoryId !in ownedCategoryIds) ||
+                    (subcategoryId.isNotBlank() &&
+                        ownedSubcategories[subcategoryId]?.categoryId != categoryId)
+                ) {
+                    Log.w(TAG, "Skipping transaction split with missing owner-scoped relationship")
+                    continue
+                }
+
+                val split = TransactionSplitEntity(
+                    id = splitObj.getString("id"),
+                    transactionId = parent.id,
+                    categoryId = categoryId,
+                    subcategoryId = subcategoryId,
+                    amount = splitObj.getDouble("amount"),
+                    note = splitObj.optString("note", ""),
+                    createdAt = splitObj.optString("createdAt", getNowIso()),
+                    updatedAt = splitObj.optString("updatedAt", getNowIso()),
+                    userId = uid
+                )
+                if (overwriteLocal || split.id !in existingSplits) {
+                    dao.insertSplits(listOf(split))
+                    existingSplits.add(split.id)
                 }
             }
 

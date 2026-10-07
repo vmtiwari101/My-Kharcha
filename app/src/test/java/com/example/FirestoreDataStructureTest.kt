@@ -82,10 +82,11 @@ class FirestoreDataStructureTest {
             last4Digits = "1234",
             createdAt = "2026-09-29T14:30:00Z",
             updatedAt = "2026-09-29T14:30:00Z",
-            isExpense = true
+            isExpense = true,
+            userId = "uid_test"
         )
 
-        val firestoreMap = originalTx.toFirestoreMap()
+        val firestoreMap = originalTx.toFirestoreMap("uid_test")
         assertEquals("tx_789", firestoreMap["id"])
         assertEquals(350.0, firestoreMap["amount"])
         assertEquals("EXPENSE", firestoreMap["type"])
@@ -106,9 +107,10 @@ class FirestoreDataStructureTest {
             name = "Salary Account",
             type = "Bank Account",
             bankName = "HDFC Bank",
-            last4Digits = "5678"
+            last4Digits = "5678",
+            userId = "uid_test"
         )
-        val accMap = account.toFirestoreMap()
+        val accMap = account.toFirestoreMap("uid_test")
         val mappedAcc = accMap.toAccountEntity("acc_1")
         assertEquals("Salary Account", mappedAcc.name)
         assertEquals("HDFC Bank", mappedAcc.bankName)
@@ -120,9 +122,10 @@ class FirestoreDataStructureTest {
             icon = "🛒",
             colour = "#10B981",
             createdAt = "",
-            updatedAt = ""
+            updatedAt = "",
+            userId = "uid_test"
         )
-        val catMap = category.toFirestoreMap()
+        val catMap = category.toFirestoreMap("uid_test")
         val mappedCat = catMap.toCategoryEntity("cat_1")
         assertEquals("Groceries", mappedCat.name)
         assertEquals("🛒", mappedCat.icon)

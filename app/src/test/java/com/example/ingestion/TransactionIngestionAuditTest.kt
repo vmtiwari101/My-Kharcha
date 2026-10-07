@@ -139,6 +139,27 @@ class TransactionIngestionAuditTest {
         assertEquals("Bakery House", parseResult.transaction?.merchant)
     }
 
+    @Test
+    fun notificationRetryUsesEventIdentityNotTransactionAttributes() {
+        val postTime = 1_798_400_000_000L
+        val text = "Paid Rs 180 to Bakery House via UPI"
+        val first = NotificationParser.parseNotification(
+            "com.phonepe.app", "Payment Alert", text, text, "", postTime, emptyList()
+        ).transaction
+        val retry = NotificationParser.parseNotification(
+            "com.phonepe.app", "Payment Alert", text, text, "", postTime, emptyList()
+        ).transaction
+        val separateEvent = NotificationParser.parseNotification(
+            "com.phonepe.app", "Payment Alert", text, text, "", postTime + 1_000L, emptyList()
+        ).transaction
+
+        assertNotNull(first)
+        assertNotNull(retry)
+        assertNotNull(separateEvent)
+        assertTrue(TransactionIngestionEngine.isDuplicateTransaction(first!!, retry!!))
+        assertFalse(TransactionIngestionEngine.isDuplicateTransaction(first, separateEvent!!))
+    }
+
     // F. Same transaction through SMS + Email
     @Test
     fun testSameTransactionSmsAndEmail() = runBlocking {
@@ -334,9 +355,19 @@ class TransactionIngestionAuditTest {
             SmsParser.RawSms("s1", "VM-BANK", "Debited 100 at Shop A", 1000L),
             SmsParser.RawSms("s2", "VM-BANK", "Debited 200 at Shop B", 5000L)
         )
-        val result = SmsParser.processSmsList(context, smsList, newerThanTimestamp = 3000L)
-        assertEquals(1, result.transactions.size)
-        assertEquals(200.0, result.transactions[0].amount, 0.01)
+        val previousParserProvider = SmsParser.liveAuthenticatedUidProvider
+        val previousIngestionProvider = TransactionIngestionEngine.liveAuthenticatedUidProvider
+        SmsParser.liveAuthenticatedUidProvider = { "historical-scan-user" }
+        TransactionIngestionEngine.liveAuthenticatedUidProvider = { "historical-scan-user" }
+        try {
+            val result = SmsParser.processSmsList(context, smsList, newerThanTimestamp = 3000L)
+            assertEquals(1, result.transactions.size)
+            assertEquals(200.0, result.transactions[0].amount, 0.01)
+            assertEquals("historical-scan-user", result.transactions[0].userId)
+        } finally {
+            SmsParser.liveAuthenticatedUidProvider = previousParserProvider
+            TransactionIngestionEngine.liveAuthenticatedUidProvider = previousIngestionProvider
+        }
     }
 
     // R. Existing transactions preserved

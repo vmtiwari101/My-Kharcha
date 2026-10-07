@@ -8,6 +8,7 @@ import com.example.data.entity.AccountEntity
 import com.example.data.entity.CardEntity
 import com.example.data.entity.CategoryEntity
 import com.example.data.entity.TransactionEntity
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -31,7 +32,23 @@ enum class IngestionStatus {
 object TransactionIngestionEngine {
 
     private const val TAG = "TransactionIngestion"
+    private const val LEGACY_OWNER = "legacy:unassigned"
     private val ingestionMutex = Mutex()
+
+    @Volatile
+    internal var liveAuthenticatedUidProvider: () -> String? = {
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase authentication is unavailable", e)
+            null
+        }
+    }
+
+    private fun authenticatedOwner(): String? =
+        liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+    private fun isCurrentOwner(owner: String): Boolean = authenticatedOwner() == owner
 
     data class ExtractedBalanceInfo(
         val accountBalance: Double? = null,
@@ -149,11 +166,32 @@ object TransactionIngestionEngine {
         cardId: String?,
         balanceInfo: ExtractedBalanceInfo,
         messageTimestamp: Long
-    ) = withContext(Dispatchers.IO) {
-        if (accountId.isNullOrEmpty()) return@withContext
+    ) {
+        val owner = authenticatedOwner() ?: return
+        applyExtractedBalanceForOwner(dao, accountId, cardId, balanceInfo, messageTimestamp, owner)
+    }
 
-        val accounts = dao.getAllAccountsSync()
+    private suspend fun applyExtractedBalanceForOwner(
+        dao: KharchaDao,
+        accountId: String?,
+        cardId: String?,
+        balanceInfo: ExtractedBalanceInfo,
+        messageTimestamp: Long,
+        owner: String
+    ) = withContext(Dispatchers.IO) {
+        if (accountId.isNullOrEmpty() || !isCurrentOwner(owner)) return@withContext
+
+        val accounts = dao.getAllAccountsSyncForUser(owner)
         val targetAcc = accounts.find { it.id == accountId } ?: return@withContext
+        if (targetAcc.userId != owner) return@withContext
+        val targetCard = cardId?.let { id ->
+            dao.getAllCardsSyncForUser(owner)
+                .firstOrNull { it.id == id && it.accountId == targetAcc.id && it.userId == owner }
+        }
+        if (cardId != null && targetCard == null) {
+            Log.w(TAG, "Balance update rejected because the card is not owned by the authenticated user or account")
+            return@withContext
+        }
 
         // CASH SAFETY: Bank/card SMS balance must NEVER update generic Cash account
         if (targetAcc.type.equals("Cash", ignoreCase = true) || targetAcc.name.equals("Cash", ignoreCase = true) || targetAcc.id == "acc-cash") {
@@ -163,7 +201,7 @@ object TransactionIngestionEngine {
 
         // NEWER BALANCE MUST PROTECT AGAINST OLDER BALANCE
         val existingTime = parseIsoOrMillisToLong(targetAcc.updatedAt)
-        if (messageTimestamp > 0 && existingTime > 0 && (existingTime - messageTimestamp > 86400000L)) {
+        if (messageTimestamp > 0 && existingTime > 0 && messageTimestamp < existingTime) {
             Log.d(TAG, "Balance update skipped: message timestamp ($messageTimestamp) is older than existing account balance timestamp ($existingTime)")
             return@withContext
         }
@@ -191,7 +229,7 @@ object TransactionIngestionEngine {
 
             // Calculate anchored initialBalance (representing Initial Debt) for Credit Cards.
             // This ensures consistency between the stored balance and the calculated balance shown in the UI.
-            val allTransactions = dao.getAllTransactionsSync()
+            val allTransactions = dao.getAllTransactionsSyncForUser(owner)
             val accTxs = allTransactions.filter { tx ->
                 TransactionIdentityResolver.isCreditCardPurchase(tx, cardId, targetAcc.id, targetAcc.last4Digits) ||
                 TransactionIdentityResolver.isCreditCardPaymentOrRefund(tx, cardId, targetAcc.id, targetAcc.last4Digits)
@@ -207,34 +245,48 @@ object TransactionIngestionEngine {
                 initialBalance = newInitialBalance,
                 updatedAt = nowIso
             )
-            dao.insertAccount(updatedAcc)
-
-            if (!cardId.isNullOrEmpty()) {
-                val card = dao.getAllCardsSync().find { it.id == cardId }
-                if (card != null) {
-                    val updatedCard = card.copy(
-                        outstandingAmount = updatedOutstanding,
-                        creditLimit = updatedCreditLimit,
-                        updatedAt = nowIso
-                    )
-                    dao.insertCard(updatedCard)
-                }
+            if (!isCurrentOwner(owner)) return@withContext
+            val updatedCard = targetCard?.copy(
+                    outstandingAmount = updatedOutstanding,
+                    creditLimit = updatedCreditLimit,
+                    updatedAt = nowIso
+                )
+            val includedPayments = accTxs.filter { transaction ->
+                TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+                    transaction,
+                    cardId,
+                    targetAcc.id,
+                    targetAcc.last4Digits
+                )
+            }.map { it.id }
+            if (!dao.applyCardBillSnapshot(
+                    userId = owner,
+                    account = updatedAcc,
+                    card = updatedCard,
+                    includedPaymentIds = includedPayments,
+                    targetIds = listOfNotNull(targetAcc.id, targetCard?.id)
+                )
+            ) {
+                Log.w(TAG, "Card balance snapshot rejected because ownership changed")
+                return@withContext
             }
             Log.d(TAG, "Updated Credit Card balance for ${targetAcc.name}: outstanding=$updatedOutstanding, limit=$updatedCreditLimit")
         } else {
             // Bank Account / Debit / UPI
             val targetBalance = balanceInfo.accountBalance
             if (targetBalance != null) {
-                val allTransactions = dao.getAllTransactionsSync()
-                val cards = dao.getAllCardsSync()
+                val allTransactions = dao.getAllTransactionsSyncForUser(owner)
                 // Replicate filtering logic from AccountsScreen.kt to ensure consistency between balance anchor and UI display.
                 // This includes both resolved transactions and those that match by last4 digits for this account.
                 var netTxSum = 0.0
                 allTransactions.forEach { tx ->
-                    val isInternal = tx.isInternalTransfer || tx.type == "INTERNAL_TRANSFER" || tx.transactionType == "INTERNAL_TRANSFER"
-                    if (isInternal) {
-                        if (tx.accountId == accountId) netTxSum -= tx.amount
-                        else if (tx.counterpartyAccountId == accountId) netTxSum += tx.amount
+                    val transferEffect = TransactionIdentityResolver.internalTransferBalanceEffect(
+                        tx,
+                        accountId,
+                        allTransactions
+                    )
+                    if (transferEffect != null) {
+                        netTxSum += transferEffect
                     } else {
                         val isDebit = tx.direction == "DEBIT" || tx.type == "EXPENSE"
                         val isCredit = tx.direction == "CREDIT" || tx.type == "INCOME"
@@ -251,6 +303,7 @@ object TransactionIngestionEngine {
                     initialBalance = newInitialBalance,
                     updatedAt = nowIso
                 )
+                if (!isCurrentOwner(owner)) return@withContext
                 dao.insertAccount(updatedAcc)
                 Log.d(TAG, "Updated Bank Account balance for ${targetAcc.name}: targetBalance=$targetBalance, newInitialBalance=$newInitialBalance")
             }
@@ -335,20 +388,41 @@ object TransactionIngestionEngine {
         if (ref1.isNotEmpty()) keys.add(ref1)
         val ref2 = extractNormalizedReference(tx.originalReference)
         if (ref2.isNotEmpty()) keys.add(ref2)
+        val ref3 = extractNormalizedReference(tx.referenceId)
+        if (ref3.isNotEmpty()) keys.add(ref3)
+        val ref4 = extractNormalizedReference(tx.transactionId)
+        if (ref4.isNotEmpty()) keys.add(ref4)
         return keys
     }
 
+    private fun sourceEventKey(tx: TransactionEntity): String? {
+        val source = tx.source.trim().uppercase(Locale.US)
+        val original = tx.originalReference.trim()
+        val eventId = when (source) {
+            "SMS" -> if (original.startsWith("SMS-EVENT-", ignoreCase = true)) {
+                original.substringAfter("SMS-EVENT-").takeIf { it.isNotBlank() }
+            } else {
+                Regex("^SMS-(?!REF-)([^-]+)-", RegexOption.IGNORE_CASE)
+                    .find(original)?.groupValues?.getOrNull(1)
+            }
+            "EMAIL" -> original.takeIf { it.startsWith("EMAIL-", ignoreCase = true) }
+                ?.substringAfter('-', "")
+            "NOTIFICATION" -> original.takeIf { it.startsWith("NOTIF-EVENT-", ignoreCase = true) }
+                ?.substringAfter("NOTIF-EVENT-", "")
+        }?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val normalizedId = eventId.uppercase(Locale.US).replace("[^A-Z0-9]".toRegex(), "")
+        return normalizedId.takeIf { it.isNotEmpty() }?.let { "$source:$it" }
+    }
+
     /**
-     * Calculates a source-independent fingerprint for a transaction when Reference ID is not available.
+     * Calculates a fingerprint only from transaction identity evidence, never from amount/date/card details.
      */
     fun calculateFingerprint(amount: Double, date: String, last4: String, ref: String, direction: String = "DEBIT"): String {
         val cleanRef = extractNormalizedReference(ref)
         if (cleanRef.isNotEmpty()) {
             return "ref-$cleanRef"
         }
-        val cleanLast4 = last4.trim().replace("[^0-9]".toRegex(), "")
-        val roundedAmount = String.format(Locale.US, "%.2f", amount)
-        return "dir-${direction}_amt-${roundedAmount}_date-${date}_last4-${cleanLast4}"
+        return ""
     }
 
     /**
@@ -391,131 +465,71 @@ object TransactionIngestionEngine {
      * Evaluates a confidence score (0 to 100) for whether [candidate] is a duplicate of [existing].
      */
     fun evaluateMatchConfidence(candidate: TransactionEntity, existing: TransactionEntity): MatchConfidence {
-        // 1. Direct originalReference check for identical source messages
-        if (candidate.originalReference.isNotEmpty() && existing.originalReference.isNotEmpty() &&
-            candidate.originalReference == existing.originalReference) {
-            return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Identical original reference string")
+        if (candidate.userId.isNotBlank() && existing.userId.isNotBlank() && candidate.userId != existing.userId) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Different transaction owners")
         }
-
         val candIsDebit = candidate.direction?.equals("DEBIT", ignoreCase = true) == true ||
                 (candidate.direction?.equals("CREDIT", ignoreCase = true) != true && candidate.type.equals("EXPENSE", ignoreCase = true))
         val existIsDebit = existing.direction?.equals("DEBIT", ignoreCase = true) == true ||
                 (existing.direction?.equals("CREDIT", ignoreCase = true) != true && existing.type.equals("EXPENSE", ignoreCase = true))
 
-        // Opposite directions on different accounts: transfer counterparts (paired transactions), NOT duplicates
-        if (candIsDebit != existIsDebit && candidate.accountId.isNotEmpty() && existing.accountId.isNotEmpty() && candidate.accountId != existing.accountId) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Opposite directions on different accounts: transfer counterpart, not duplicate")
+        if (candIsDebit != existIsDebit) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Direction mismatch")
         }
 
-        // 2. Normalized Reference ID check (highest priority: RRN, UTR, UPI Ref)
+        if (Math.abs(candidate.amount - existing.amount) >= 0.01) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Amount mismatch")
+        }
+
+        val candidateKind = transactionIdentityKind(candidate)
+        val existingKind = transactionIdentityKind(existing)
+        if (hasConflictingSpecificKinds(candidateKind, existingKind)) {
+            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Transaction type mismatch")
+        }
+
+        // A source event ID is useful for retry idempotency, but is deliberately source-qualified.
+        val candidateEvent = sourceEventKey(candidate)
+        if (candidateEvent != null && candidateEvent == sourceEventKey(existing)) {
+            return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Same source event ID")
+        }
+
+        // Normalized payment references are source-independent evidence for cross-source merging.
         val candRefs = getTransactionReferenceKeys(candidate)
         val existRefs = getTransactionReferenceKeys(existing)
         if (candRefs.isNotEmpty() && existRefs.isNotEmpty()) {
             val commonRefs = candRefs.intersect(existRefs)
             if (commonRefs.isNotEmpty()) {
-                if (Math.abs(candidate.amount - existing.amount) < 0.01) {
-                    return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Matched reference ID: $commonRefs with matching amount")
-                }
+                return MatchConfidence(100, isMatch = true, isHardMismatch = false, "Matched transaction reference: $commonRefs")
             } else {
                 return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Conflicting reference IDs: $candRefs vs $existRefs")
             }
         }
 
-        // 3. Amount check
-        if (Math.abs(candidate.amount - existing.amount) >= 0.01) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Amount mismatch: ${candidate.amount} vs ${existing.amount}")
-        }
+        return MatchConfidence(
+            score = 0,
+            isMatch = false,
+            isHardMismatch = false,
+            reasoning = "No shared transaction identity evidence"
+        )
+    }
 
-        // 4. Direction check (Exempt transfers/credit card bill payments from hard direction mismatch)
-        val isCandTransferOrCc = candidate.isInternalTransfer || candidate.type == "INTERNAL_TRANSFER" || 
-            candidate.transactionType == "CREDIT_CARD_BILL_PAYMENT" || candidate.transactionType == "CARD_PAYMENT"
-        val isExistTransferOrCc = existing.isInternalTransfer || existing.type == "INTERNAL_TRANSFER" || 
-            existing.transactionType == "CREDIT_CARD_BILL_PAYMENT" || existing.transactionType == "CARD_PAYMENT"
-        if (candIsDebit != existIsDebit && !isCandTransferOrCc && !isExistTransferOrCc) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Direction mismatch")
-        }
-
-        // 5. Date check (without matching reference ID, different dates cannot be merged)
-        if (candidate.date != existing.date) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Date mismatch without reference ID: ${candidate.date} vs ${existing.date}")
-        }
-
-        // 5b. Time check (if times are present for both and differ by > 30 mins, treat as separate transactions)
-        if (candidate.time.isNotBlank() && existing.time.isNotBlank()) {
-            try {
-                val candParts = candidate.time.split(":")
-                val existParts = existing.time.split(":")
-                if (candParts.size >= 2 && existParts.size >= 2) {
-                    val candMins = candParts[0].toInt() * 60 + candParts[1].toInt()
-                    val existMins = existParts[0].toInt() * 60 + existParts[1].toInt()
-                    if (Math.abs(candMins - existMins) > 30) {
-                        return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Time difference > 30 mins without reference ID: ${candidate.time} vs ${existing.time}")
-                    }
-                }
-            } catch (e: Exception) {
-                // Ignore time parsing errors
+    private fun transactionIdentityKind(tx: TransactionEntity): String {
+        val type = (tx.transactionType ?: tx.type).uppercase(Locale.US)
+        return when {
+            type.contains("CARD_PAYMENT") || type.contains("CREDIT_CARD_BILL") -> "CARD_PAYMENT"
+            tx.isInternalTransfer || type.contains("TRANSFER") -> "TRANSFER"
+            type.contains("CASH_WITHDRAWAL") -> "CASH_WITHDRAWAL"
+            else -> if (tx.direction.equals("CREDIT", ignoreCase = true) || tx.type.equals("INCOME", ignoreCase = true)) {
+                "INCOME"
+            } else {
+                "EXPENSE"
             }
         }
+    }
 
-        // 6. Last 4 Digits conflict check (exempt transfers and credit card bill payments)
-        val candLast4 = candidate.last4Digits.trim().replace("[^0-9]".toRegex(), "")
-        val existLast4 = existing.last4Digits.trim().replace("[^0-9]".toRegex(), "")
-        if (candLast4.length == 4 && existLast4.length == 4 && candLast4 != existLast4 && !isCandTransferOrCc && !isExistTransferOrCc) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Last4 mismatch: $candLast4 vs $existLast4")
-        }
-
-        // 7. Merchant conflict check
-        val candMerchant = candidate.merchant.trim()
-        val existMerchant = existing.merchant.trim()
-        if (!isMerchantCompatible(candMerchant, existMerchant)) {
-            return MatchConfidence(0, isMatch = false, isHardMismatch = true, "Distinct merchant mismatch: '$candMerchant' vs '$existMerchant'")
-        }
-
-        // 8. Positive Score Calculation
-        var score = 40 // Base score for same direction + same amount + same date
-        if (isCandTransferOrCc || isExistTransferOrCc) {
-            score += 20
-        }
-
-        // Merchant evidence
-        val isExactMerchant = candMerchant.equals(existMerchant, ignoreCase = true) && candMerchant.isNotBlank() && !candMerchant.equals("Unknown Merchant", true)
-        val isCompatibleMerchant = isMerchantCompatible(candMerchant, existMerchant) && candMerchant.isNotBlank() && existMerchant.isNotBlank()
-
-        if (isExactMerchant) {
-            score += 30
-        } else if (isCompatibleMerchant) {
-            score += 25
-        } else {
-            val noteOrRefMatch = candidate.note.lowercase(Locale.US).contains(existMerchant.lowercase(Locale.US)) ||
-                    existing.note.lowercase(Locale.US).contains(candMerchant.lowercase(Locale.US)) ||
-                    candidate.originalReference.lowercase(Locale.US).contains(existMerchant.lowercase(Locale.US)) ||
-                    existing.originalReference.lowercase(Locale.US).contains(candMerchant.lowercase(Locale.US))
-            if (noteOrRefMatch) score += 20
-        }
-
-        // Last4 evidence
-        if (candLast4.length == 4 && existLast4.length == 4 && candLast4 == existLast4) {
-            score += 20
-        } else if (candLast4.length == 4 || existLast4.length == 4) {
-            score += 10
-        }
-
-        // Payment method or Account evidence
-        if (candidate.paymentMethod.isNotBlank() && existing.paymentMethod.isNotBlank() &&
-            candidate.paymentMethod.equals(existing.paymentMethod, ignoreCase = true)) {
-            score += 10
-        }
-        if (candidate.accountId.isNotBlank() && existing.accountId.isNotBlank() && candidate.accountId == existing.accountId) {
-            score += 10
-        }
-
-        val isMatch = score >= 70
-        return MatchConfidence(
-            score = score,
-            isMatch = isMatch,
-            isHardMismatch = false,
-            reasoning = "Score=$score, ExactMerchant=$isExactMerchant, CompatibleMerchant=$isCompatibleMerchant, SameLast4=${candLast4 == existLast4}"
-        )
+    private fun hasConflictingSpecificKinds(first: String, second: String): Boolean {
+        val genericKinds = setOf("EXPENSE", "INCOME")
+        return first != second && first !in genericKinds && second !in genericKinds
     }
 
     /**
@@ -767,10 +781,27 @@ object TransactionIngestionEngine {
     suspend fun ingestTransaction(
         context: Context,
         rawTx: TransactionEntity,
-        rawText: String
+        rawText: String,
+        expectedOwnerUid: String? = null
     ): Pair<TransactionEntity?, IngestionStatus> = ingestionMutex.withLock {
         withContext(Dispatchers.IO) {
             try {
+            val owner = authenticatedOwner()
+            if (owner == null) {
+                Log.w(TAG, "Ingestion rejected because no live authenticated Firebase user is available")
+                return@withContext Pair(null, IngestionStatus.FAILED)
+            }
+            if (expectedOwnerUid != null &&
+                (expectedOwnerUid.isBlank() || expectedOwnerUid == LEGACY_OWNER || expectedOwnerUid != owner)
+            ) {
+                Log.w(TAG, "Ingestion rejected because the live owner does not match the expected SMS owner")
+                return@withContext Pair(null, IngestionStatus.FAILED)
+            }
+            if (rawTx.userId.isNotBlank() && rawTx.userId != owner) {
+                Log.w(TAG, "Ingestion rejected because the transaction belongs to a different user")
+                return@withContext Pair(null, IngestionStatus.FAILED)
+            }
+
             // Guard against promotional / marketing / advertisement messages
             if (SmsParser.isPromotionalOrAdvertisementMessage(rawText) || (rawTx.note.isNotBlank() && SmsParser.isPromotionalOrAdvertisementMessage(rawTx.note))) {
                 Log.d(TAG, "Ingestion Skipped: Message detected as promotional/advertisement (${rawTx.amount})")
@@ -780,20 +811,32 @@ object TransactionIngestionEngine {
             val db = AppDatabase.getDatabase(context)
             val dao = db.kharchaDao()
             
-            val countBefore = dao.getAllTransactionsSync().size
+            val countBefore = dao.getAllTransactionsSyncForUser(owner).size
             Log.d(TAG, "Ingestion Start: Room count before = $countBefore")
             Log.d(TAG, "Processing SMS/Source: ${rawTx.source}, Amount: ${rawTx.amount}, Date: ${rawTx.date}")
 
-            val existingTxs = dao.getAllTransactionsSync()
-            val accounts = dao.getAllAccountsSync()
-            val cards = dao.getAllCardsSync()
+            val existingTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
+            existingTxs.firstOrNull { it.id == rawTx.id }?.let { existing ->
+                if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
+                return@withContext Pair(existing, IngestionStatus.DUPLICATE)
+            }
+            val accounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
+            val cards = dao.getAllCardsSyncForUser(owner).filter { it.userId == owner }
 
             val textLower = rawText.lowercase(Locale.ENGLISH)
 
             // Direction Determinations (Debit vs Credit)
-            val isDebit = rawTx.type.uppercase(Locale.ENGLISH) == "EXPENSE"
-            val direction = if (isDebit) "DEBIT" else "CREDIT"
-            val rawTx = rawTx.copy(direction = direction)
+            val direction = rawTx.direction
+                ?.takeIf { it.equals("DEBIT", ignoreCase = true) || it.equals("CREDIT", ignoreCase = true) }
+                ?.uppercase(Locale.ENGLISH)
+                ?: when {
+                    rawTx.type.equals("EXPENSE", ignoreCase = true) -> "DEBIT"
+                    rawTx.type.equals("INCOME", ignoreCase = true) -> "CREDIT"
+                    rawTx.isExpense -> "DEBIT"
+                    else -> "CREDIT"
+                }
+            val isDebit = direction == "DEBIT"
+            val rawTx = rawTx.copy(direction = direction, userId = owner)
 
             // 1. Calculate Source-Independent Fingerprint
             val fingerprint = calculateFingerprint(
@@ -802,7 +845,7 @@ object TransactionIngestionEngine {
                 last4 = rawTx.last4Digits,
                 ref = rawTx.transactionReference,
                 direction = direction
-            )
+            ).ifEmpty { sourceEventKey(rawTx)?.let { "event-$it" }.orEmpty() }
 
             // 2. Card / Account Mapping: Create or reuse an account/card only when reliable bank/issuer + valid last4 evidence is available.
             val extractedLast4 = rawTx.last4Digits.ifEmpty { TransactionIdentityResolver.extractLast4(textLower) }
@@ -828,20 +871,47 @@ object TransactionIngestionEngine {
             val isValid4DigitLast4 = extractedLast4.length == 4 && extractedLast4.all { it.isDigit() }
             val isCreditCard = (textLower.contains("credit card") || textLower.contains("credit-card") || textLower.contains("cc ending")) ||
                     ((textLower.contains("card ending") || textLower.contains("card xx") || textLower.contains("card no") || textLower.contains("card ending in")) && !textLower.contains("debit card"))
+            val smsIdentityAmbiguous = rawTx.source.equals("SMS", ignoreCase = true) &&
+                if (isCreditCard) {
+                    val matchingCards = cards.filter { card ->
+                        card.last4Digits == extractedLast4 &&
+                            card.type.equals("Credit Card", ignoreCase = true) &&
+                            (isBankNameMatch(card.name, bankName) ||
+                                accounts.any { acc ->
+                                    acc.id == card.accountId &&
+                                        isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName)
+                                })
+                    }
+                    val matchingCardAccounts = accounts.filter { acc ->
+                        acc.last4Digits == extractedLast4 &&
+                            (acc.type.equals("Credit Card", ignoreCase = true) ||
+                                acc.name.contains("Card", ignoreCase = true)) &&
+                            isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName)
+                    }
+                    matchingCards.size > 1 || matchingCardAccounts.size > 1
+                } else {
+                    accounts.count { acc ->
+                        acc.last4Digits == extractedLast4 &&
+                            !acc.type.equals("Credit Card", ignoreCase = true) &&
+                            isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName)
+                    } > 1
+                }
 
             // Prepare potential auto-creation ONLY when reliable bank/issuer + valid 4-digit last4 evidence exists.
             // CRITICAL: We DO NOT insert into Room immediately. We defer insertion until the transaction is successfully accepted!
             var pendingNewAccount: AccountEntity? = null
             var pendingNewCard: CardEntity? = null
 
-            if (needsReview && isValid4DigitLast4 && bankName.isNotBlank()) {
+            if (needsReview && isValid4DigitLast4 && bankName.isNotBlank() &&
+                !smsIdentityAmbiguous && !rawTx.source.equals("SMS", ignoreCase = true)
+            ) {
                 if (isCreditCard) {
-                    val existingCard = cards.find { card ->
+                    val existingCard = cards.singleOrNull { card ->
                         card.last4Digits == extractedLast4 && card.type.equals("Credit Card", ignoreCase = true) &&
                         (isBankNameMatch(card.name, bankName) || 
                          accounts.any { acc -> acc.id == card.accountId && isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName) })
                     }
-                    val existingCardAcc = accounts.find { acc ->
+                    val existingCardAcc = accounts.singleOrNull { acc ->
                         acc.last4Digits == extractedLast4 && 
                         (acc.type.equals("Credit Card", ignoreCase = true) || acc.name.contains("Card", ignoreCase = true)) &&
                         isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName)
@@ -861,7 +931,8 @@ object TransactionIngestionEngine {
                             type = "Credit Card",
                             last4Digits = extractedLast4,
                             createdAt = getNowIsoString(),
-                            updatedAt = getNowIsoString()
+                            updatedAt = getNowIsoString(),
+                            userId = owner
                         )
                         pendingNewCard = newCard
                         mappedAccountId = existingCardAcc.id
@@ -883,7 +954,8 @@ object TransactionIngestionEngine {
                             isDefault = false,
                             isOwnedByMe = true,
                             createdAt = getNowIsoString(),
-                            updatedAt = getNowIsoString()
+                            updatedAt = getNowIsoString(),
+                            userId = owner
                         )
                         val newCard = CardEntity(
                             id = newCardId,
@@ -892,7 +964,8 @@ object TransactionIngestionEngine {
                             type = "Credit Card",
                             last4Digits = extractedLast4,
                             createdAt = getNowIsoString(),
-                            updatedAt = getNowIsoString()
+                            updatedAt = getNowIsoString(),
+                            userId = owner
                         )
                         pendingNewAccount = newAcc
                         pendingNewCard = newCard
@@ -902,7 +975,7 @@ object TransactionIngestionEngine {
                         needsReview = false
                     }
                 } else {
-                    val existingAcc = accounts.find { acc ->
+                    val existingAcc = accounts.singleOrNull { acc ->
                         acc.last4Digits == extractedLast4 && 
                         !acc.type.equals("Credit Card", ignoreCase = true) &&
                         isBankNameMatch(acc.bankName.ifEmpty { acc.name }, bankName)
@@ -925,7 +998,8 @@ object TransactionIngestionEngine {
                             isDefault = false,
                             isOwnedByMe = true,
                             createdAt = getNowIsoString(),
-                            updatedAt = getNowIsoString()
+                            updatedAt = getNowIsoString(),
+                            userId = owner
                         )
                         pendingNewAccount = newAcc
                         mappedAccountId = newAccId
@@ -946,7 +1020,7 @@ object TransactionIngestionEngine {
                 isDuplicateTransaction(resolvedRawTx, existing)
             }
 
-            // Check if there is an auto-generated internal transfer counterpart waiting for confirmation
+            // Check for an existing auto-generated internal transfer counterpart to enrich.
             val pendingCounterpart = if (duplicateTx == null) {
                 existingTxs.find { existing ->
                     existing.isInternalTransfer &&
@@ -960,12 +1034,17 @@ object TransactionIngestionEngine {
             } else null
 
             if (pendingCounterpart != null) {
+                if (pendingCounterpart.userId != owner) {
+                    Log.w(TAG, "Pending transaction update rejected because ownership is inconsistent")
+                    return@withContext Pair(null, IngestionStatus.FAILED)
+                }
                 val updatedCounterpart = pendingCounterpart.copy(
                     note = rawTx.note.ifEmpty { pendingCounterpart.note },
                     originalReference = rawTx.originalReference.ifEmpty { pendingCounterpart.originalReference },
                     transactionReference = rawTx.transactionReference.ifEmpty { pendingCounterpart.transactionReference },
                     updatedAt = getNowIsoString()
                 )
+                if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                 val rowId = dao.insertTransaction(updatedCounterpart)
                 if (rowId != -1L) {
                     Log.d(TAG, "Successfully updated pending counterpart: ${updatedCounterpart.id}")
@@ -977,6 +1056,10 @@ object TransactionIngestionEngine {
             }
 
             if (duplicateTx != null) {
+                if (dao.getSplitsForTransactionSync(owner, duplicateTx.id).isNotEmpty()) {
+                    return@withContext Pair(duplicateTx, IngestionStatus.DUPLICATE)
+                }
+
                 // If a new AccountEntity/CardEntity was discovered during ingestion and it is not needsReview,
                 // persist it so it is not lost when merging metadata into an existing duplicate record.
                 var effectiveAccounts = accounts
@@ -984,6 +1067,10 @@ object TransactionIngestionEngine {
 
                 // Automatically persist created AccountEntity/CardEntity so accountId/cardId always point to a valid Room record
                 if (pendingNewAccount != null) {
+                    if (pendingNewAccount.userId != owner) {
+                        return@withContext Pair(null, IngestionStatus.FAILED)
+                    }
+                    if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                     dao.insertAccount(pendingNewAccount)
                     effectiveAccounts = if (accounts.none { it.id == pendingNewAccount.id }) {
                         accounts + pendingNewAccount
@@ -991,6 +1078,10 @@ object TransactionIngestionEngine {
                     Log.d(TAG, "Auto-created AccountEntity persisted on duplicate merge: ${pendingNewAccount.id} (${pendingNewAccount.name})")
                 }
                 if (pendingNewCard != null) {
+                    if (pendingNewCard.userId != owner) {
+                        return@withContext Pair(null, IngestionStatus.FAILED)
+                    }
+                    if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                     dao.insertCard(pendingNewCard)
                     effectiveCards = if (cards.none { it.id == pendingNewCard.id }) {
                         cards + pendingNewCard
@@ -1035,22 +1126,14 @@ object TransactionIngestionEngine {
                 
                 // Intelligently merge metadata without creating duplicate records (Rule 5, 6)
                 val mergedTx = mergeTransactionMetadata(duplicateTx, enrichedIncoming, effectiveAccounts, effectiveCards)
-                val rowId = dao.insertTransaction(mergedTx)
-                if (rowId != -1L) {
+                if (mergedTx.userId != owner || duplicateTx.userId != owner) {
+                    Log.w(TAG, "Duplicate merge rejected because transaction ownership is inconsistent")
+                    return@withContext Pair(null, IngestionStatus.FAILED)
+                }
+                if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
+                val mergedRows = dao.upsertTransactionAndLinkedTransfer(owner, mergedTx)
+                if (mergedRows != null) {
                     Log.d(TAG, "Duplicate prevented and metadata merged for transaction: ${mergedTx.id} (Ref: ${mergedTx.transactionReference})")
-
-                    // Extract and apply balance updates safely if account identity is known
-                    if (mappedAccountId.isNotEmpty()) {
-                        val balInfo = extractBalanceInfo(rawText)
-                        if (balInfo != null) {
-                            val msgTime = if (rawTx.updatedAt.isNotEmpty()) {
-                                parseIsoOrMillisToLong(rawTx.updatedAt)
-                            } else {
-                                System.currentTimeMillis()
-                            }
-                            applyExtractedBalance(dao, mappedAccountId, mappedCardId, balInfo, msgTime)
-                        }
-                    }
 
                     return@withContext Pair(mergedTx, IngestionStatus.DUPLICATE)
                 } else {
@@ -1125,12 +1208,22 @@ object TransactionIngestionEngine {
             if (!isInternal && sourceOwned) {
                 if (isCardBillPayment) {
                     val targetBank = extractBankName(textLower, rawTx.merchant)
-                    val matchedCreditCard = if (effectiveCounterparty4.isNotEmpty()) {
-                        cards.find { it.last4Digits == effectiveCounterparty4 && (targetBank.isEmpty() || isBankNameMatch(it.name, targetBank)) }
+                    val matchedCreditCardCandidates = if (effectiveCounterparty4.isNotEmpty()) {
+                        cards.filter { it.last4Digits == effectiveCounterparty4 && (targetBank.isEmpty() || isBankNameMatch(it.name, targetBank)) }
                     } else null
-                    val matchedCreditAcc = if (effectiveCounterparty4.isNotEmpty()) {
-                        accounts.find { it.isOwnedByMe && it.last4Digits == effectiveCounterparty4 && it.type.equals("Credit Card", ignoreCase = true) && (targetBank.isEmpty() || isBankNameMatch(it.bankName.ifEmpty { it.name }, targetBank)) }
+                    val matchedCreditAccountCandidates = if (effectiveCounterparty4.isNotEmpty()) {
+                        accounts.filter { it.isOwnedByMe && it.last4Digits == effectiveCounterparty4 && it.type.equals("Credit Card", ignoreCase = true) && (targetBank.isEmpty() || isBankNameMatch(it.bankName.ifEmpty { it.name }, targetBank)) }
                     } else null
+                    val matchedCreditCard = if (rawTx.source.equals("SMS", ignoreCase = true)) {
+                        matchedCreditCardCandidates?.singleOrNull()
+                    } else {
+                        matchedCreditCardCandidates?.firstOrNull()
+                    }
+                    val matchedCreditAcc = if (rawTx.source.equals("SMS", ignoreCase = true)) {
+                        matchedCreditAccountCandidates?.singleOrNull()
+                    } else {
+                        matchedCreditAccountCandidates?.firstOrNull()
+                    }
 
                     val targetCreditAccId = matchedCreditAcc?.id ?: matchedCreditCard?.accountId
                     isInternal = true
@@ -1138,13 +1231,23 @@ object TransactionIngestionEngine {
 
                     if (targetCreditAccId != null) {
                         if (mappedAccountId == targetCreditAccId) {
-                            val bankSourceAcc = accounts.find { it.isOwnedByMe && it.id != targetCreditAccId && !it.type.equals("Credit Card", ignoreCase = true) }
+                            val bankSourceAcc = if (rawTx.source.equals("SMS", ignoreCase = true)) {
+                                null
+                            } else {
+                                accounts.firstOrNull {
+                                    it.isOwnedByMe && it.id != targetCreditAccId &&
+                                        !it.type.equals("Credit Card", ignoreCase = true)
+                                }
+                            }
                             if (bankSourceAcc != null) {
                                 mappedAccountId = bankSourceAcc.id
                                 mappedCardId = null
+                            } else if (rawTx.source.equals("SMS", ignoreCase = true)) {
+                                mappedAccountId = ""
+                                mappedCardId = null
                             }
                         }
-                        if (targetCreditAccId != mappedAccountId) {
+                        if (mappedAccountId.isNotBlank() && targetCreditAccId != mappedAccountId) {
                             transferGroupId = "tg-internal-" + UUID.randomUUID().toString().substring(0, 8)
                             counterpartyId = targetCreditAccId
                             needsReview = false
@@ -1264,17 +1367,32 @@ object TransactionIngestionEngine {
             )
 
             // D: Auto-Pairing with real counterpart transactions arriving from other sources
+            var linkedTransferPair: Pair<TransactionEntity, TransactionEntity>? = null
             if (sourceOwned) {
-                val isIncomingDebit = direction == "DEBIT" || rawTx.type == "EXPENSE"
+                val isIncomingDebit = finalDirection == "DEBIT"
+                val incomingReferences = getTransactionReferenceKeys(finalTx)
+                val isTransferOrCardPayment = isInternal ||
+                    finalTxType == "INTERNAL_TRANSFER" ||
+                    finalTxType == "CARD_PAYMENT" ||
+                    finalTxType == "CREDIT_CARD_BILL_PAYMENT"
                 val pairingMatch = existingTxs.find { other ->
-                    other.id != rawTx.id &&
+                    isTransferOrCardPayment &&
+                    incomingReferences.isNotEmpty() &&
+                    incomingReferences.intersect(getTransactionReferenceKeys(other)).isNotEmpty() &&
+                    other.id != finalTx.id &&
+                    other.userId == owner &&
                     other.date == rawTx.date &&
                     Math.abs(other.amount - rawTx.amount) < 0.01 &&
                     ((isIncomingDebit && (other.direction == "CREDIT" || other.type == "INCOME")) ||
                      (!isIncomingDebit && (other.direction == "DEBIT" || other.type == "EXPENSE"))) &&
                     other.accountId != mappedAccountId &&
                     (accounts.find { it.id == other.accountId }?.isOwnedByMe == true) &&
-                    (counterpartyId == null || other.accountId == counterpartyId)
+                    (counterpartyId == null || other.accountId == counterpartyId) &&
+                    (other.isInternalTransfer || other.type == "INTERNAL_TRANSFER" ||
+                        other.transactionType == "INTERNAL_TRANSFER" ||
+                        other.transactionType == "CARD_PAYMENT" ||
+                        other.transactionType == "CREDIT_CARD_BILL_PAYMENT" ||
+                        isGeneralTransfer || isCardBillPayment)
                 }
 
                 if (pairingMatch != null) {
@@ -1285,8 +1403,21 @@ object TransactionIngestionEngine {
                         accounts.find { it.id == pairingMatch.accountId }?.type?.contains("Card", ignoreCase = true) == true
                     val pairedType = if (isEitherCardPayment) "CREDIT_CARD_BILL_PAYMENT" else "INTERNAL_TRANSFER"
 
+                    if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                     dao.insertCategory(
-                        CategoryEntity("cat-transfer", "Internal Transfer", "", "🔄", "#3B82F6", true, true, false, getNowIsoString(), getNowIsoString())
+                        CategoryEntity(
+                            id = "cat-transfer",
+                            name = "Internal Transfer",
+                            nameHindi = "",
+                            icon = "🔄",
+                            colour = "#3B82F6",
+                            isDefault = true,
+                            isActive = true,
+                            isIncome = false,
+                            createdAt = getNowIsoString(),
+                            updatedAt = getNowIsoString(),
+                            userId = owner
+                        )
                     )
 
                     finalTx = finalTx.copy(
@@ -1313,24 +1444,47 @@ object TransactionIngestionEngine {
                         needsReview = false,
                         updatedAt = getNowIsoString()
                     )
-                    dao.insertTransaction(updatedOther)
+                    if (updatedOther.userId != owner || finalTx.userId != owner) {
+                        Log.w(TAG, "Transfer pairing rejected because transaction ownership is inconsistent")
+                        return@withContext Pair(null, IngestionStatus.FAILED)
+                    }
+                    linkedTransferPair = finalTx to updatedOther
                     Log.d(TAG, "Successfully paired real transactions into group: $groupToUse (Subtype: $pairedType)")
                 }
             }
 
             // Insert primary transaction
-            val rowId = dao.insertTransaction(finalTx)
+            if (finalTx.userId != owner) {
+                Log.w(TAG, "Transaction write rejected because transaction ownership is inconsistent")
+                return@withContext Pair(null, IngestionStatus.FAILED)
+            }
+            if (pendingNewAccount?.userId?.let { it != owner } == true ||
+                pendingNewCard?.userId?.let { it != owner } == true
+            ) {
+                Log.w(TAG, "Account or card write rejected because ownership is inconsistent")
+                return@withContext Pair(null, IngestionStatus.FAILED)
+            }
+            if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
+            val rowId = if (linkedTransferPair != null) {
+                if (!dao.saveLinkedTransferPair(owner, linkedTransferPair.first, linkedTransferPair.second)) -1L
+                else dao.getTransactionRowId(owner, finalTx.id) ?: -1L
+            } else {
+                if (dao.upsertTransactionAndLinkedTransfer(owner, finalTx) == null) -1L
+                else dao.getTransactionRowId(owner, finalTx.id) ?: -1L
+            }
             
             if (rowId != -1L) {
-                val countAfter = dao.getAllTransactionsSync().size
+                val countAfter = dao.getAllTransactionsSyncForUser(owner).size
                 Log.d(TAG, "Room insert SUCCESS: ID=${finalTx.id}, RowId=$rowId, CountAfter=$countAfter")
                 
                 // Automatic Account or Card creation upon successful transaction insertion
                 if (pendingNewAccount != null) {
+                    if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                     dao.insertAccount(pendingNewAccount)
                     Log.d(TAG, "Auto-created AccountEntity inserted: ${pendingNewAccount.id} (${pendingNewAccount.name})")
                 }
                 if (pendingNewCard != null) {
+                    if (!isCurrentOwner(owner)) return@withContext Pair(null, IngestionStatus.FAILED)
                     dao.insertCard(pendingNewCard)
                     Log.d(TAG, "Auto-created CardEntity inserted: ${pendingNewCard.id} (${pendingNewCard.name})")
                 }
@@ -1345,7 +1499,14 @@ object TransactionIngestionEngine {
                             parseIsoOrMillisToLong(finalTx.updatedAt)
                         }
                         val validTime = if (msgTime > 0) msgTime else System.currentTimeMillis()
-                        applyExtractedBalance(dao, mappedAccountId, mappedCardId, balInfo, validTime)
+                        applyExtractedBalanceForOwner(
+                            dao,
+                            mappedAccountId,
+                            mappedCardId,
+                            balInfo,
+                            validTime,
+                            owner
+                        )
                     }
                 }
             } else {
@@ -1367,14 +1528,20 @@ object TransactionIngestionEngine {
      * One-time cleanup / migration to remove duplicate transactions in the database,
      * merging useful metadata into a single preserved record per transaction (Rule 9, 10, 11).
      */
-    suspend fun cleanupDuplicateTransactions(dao: KharchaDao): Int = withContext(Dispatchers.IO) {
+    suspend fun cleanupDuplicateTransactions(dao: KharchaDao): Int {
+        val owner = authenticatedOwner() ?: return 0
+        return cleanupDuplicateTransactionsForOwner(dao, owner)
+    }
+
+    private suspend fun cleanupDuplicateTransactionsForOwner(dao: KharchaDao, owner: String): Int =
+        withContext(Dispatchers.IO) {
         var removedCount = 0
         try {
-            val allTxs = dao.getAllTransactionsSync()
+            val allTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
             if (allTxs.size <= 1) return@withContext 0
 
-            val accounts = dao.getAllAccountsSync()
-            val cards = dao.getAllCardsSync()
+            val accounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
+            val cards = dao.getAllCardsSyncForUser(owner).filter { it.userId == owner }
 
             val processedIds = mutableSetOf<String>()
 
@@ -1399,26 +1566,24 @@ object TransactionIngestionEngine {
                     var merged = primary
                     for (dup in distinctTxs) {
                         if (dup.id != primary.id) {
-                            merged = mergeTransactionMetadata(merged, dup, accounts, cards)
-                            // Preserve splits
-                            val splits = dao.getSplitsForTransactionSync(dup.id)
-                            if (splits.isNotEmpty()) {
-                                val remappedSplits = splits.map { it.copy(transactionId = primary.id) }
-                                dao.insertSplits(remappedSplits)
-                                dao.deleteSplitsForTransaction(dup.id)
+                            val splits = dao.getSplitsForTransactionSync(owner, dup.id)
+                            if (splits.isNotEmpty() || splits.any { it.userId != owner }) {
+                                processedIds.add(dup.id)
+                                continue
                             }
-                            dao.deleteTransaction(dup.id)
+                            merged = mergeTransactionMetadata(merged, dup, accounts, cards)
+                            dao.deleteTransactionAndSplits(owner, dup.id)
                             processedIds.add(dup.id)
                             removedCount++
                         }
                     }
-                    dao.insertTransaction(merged)
+                    if (merged.userId == owner) dao.insertTransaction(merged)
                     processedIds.add(primary.id)
                 }
             }
 
             // 2. Pass: Secondary conservative fingerprint deduplication for transactions without reference ID
-            val remainingTxs = dao.getAllTransactionsSync()
+            val remainingTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
             val remainingList = remainingTxs.filter { !processedIds.contains(it.id) }.toMutableList()
 
             var i = 0
@@ -1428,24 +1593,23 @@ object TransactionIngestionEngine {
                 if (candidateDups.isNotEmpty()) {
                     var merged = current
                     for (dup in candidateDups) {
+                        val splits = dao.getSplitsForTransactionSync(owner, dup.id)
+                        if (splits.isNotEmpty() || splits.any { it.userId != owner }) {
+                            processedIds.add(dup.id)
+                            continue
+                        }
                         merged = mergeTransactionMetadata(
                             merged,
                             dup,
                             accounts,
                             cards
                         )
-                        val splits = dao.getSplitsForTransactionSync(dup.id)
-                        if (splits.isNotEmpty()) {
-                            val remappedSplits = splits.map { it.copy(transactionId = current.id) }
-                            dao.insertSplits(remappedSplits)
-                            dao.deleteSplitsForTransaction(dup.id)
-                        }
-                        dao.deleteTransaction(dup.id)
+                        dao.deleteTransactionAndSplits(owner, dup.id)
                         remainingList.remove(dup)
                         processedIds.add(dup.id)
                         removedCount++
                     }
-                    dao.insertTransaction(merged)
+                    if (merged.userId == owner) dao.insertTransaction(merged)
                     remainingList[i] = merged
                 }
                 i++
@@ -1458,10 +1622,18 @@ object TransactionIngestionEngine {
         return@withContext removedCount
     }
 
-    suspend fun cleanupHistoricalIncorrectSmsTransactions(dao: KharchaDao): Int = withContext(Dispatchers.IO) {
+    suspend fun cleanupHistoricalIncorrectSmsTransactions(dao: KharchaDao): Int {
+        val owner = authenticatedOwner() ?: return 0
+        return cleanupHistoricalIncorrectSmsTransactionsForOwner(dao, owner)
+    }
+
+    private suspend fun cleanupHistoricalIncorrectSmsTransactionsForOwner(
+        dao: KharchaDao,
+        owner: String
+    ): Int = withContext(Dispatchers.IO) {
         var deletedCount = 0
         try {
-            val allTxs = dao.getAllTransactionsSync()
+            val allTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
             for (tx in allTxs) {
                 val merchantLower = tx.merchant.lowercase(Locale.ENGLISH)
                 val noteLower = tx.note.lowercase(Locale.ENGLISH)
@@ -1514,7 +1686,8 @@ object TransactionIngestionEngine {
                 val isLegacyCounterpart = tx.id.startsWith("tx-transfer-")
 
                 if (isBalanceOrLimitOnly || isBillReminder || isIncorrectCred || isLegacyCounterpart) {
-                    dao.deleteTransaction(tx.id)
+                    if (dao.getSplitsForTransactionSync(owner, tx.id).isNotEmpty()) continue
+                    dao.deleteTransactionAndSplits(owner, tx.id)
                     Log.d("DatabaseCleanup", "Deleted non-financial or legacy record: ID=${tx.id}, Merchant=${tx.merchant}, Amount=${tx.amount}")
                     deletedCount++
                 }
@@ -1525,14 +1698,21 @@ object TransactionIngestionEngine {
         return@withContext deletedCount
     }
 
-    suspend fun normalizeExistingTransactions(dao: KharchaDao): Int = withContext(Dispatchers.IO) {
+    suspend fun normalizeExistingTransactions(dao: KharchaDao): Int {
+        val owner = authenticatedOwner() ?: return 0
+        return normalizeExistingTransactionsForOwner(dao, owner)
+    }
+
+    private suspend fun normalizeExistingTransactionsForOwner(dao: KharchaDao, owner: String): Int =
+        withContext(Dispatchers.IO) {
         // Run database cleanup of historical incorrect records first!
-        cleanupHistoricalIncorrectSmsTransactions(dao)
+        cleanupHistoricalIncorrectSmsTransactionsForOwner(dao, owner)
 
         var fixedCount = 0
         try {
-            val allTxs = dao.getAllTransactionsSync()
+            val allTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
             for (tx in allTxs) {
+                if (tx.userId != owner) continue
                 var merchant = tx.merchant.trim()
                 val lower = merchant.lowercase(Locale.ENGLISH)
                 val isBadMerchant = lower.isEmpty() ||
@@ -1607,10 +1787,10 @@ object TransactionIngestionEngine {
             }
 
             // Link existing self transfers and clean up any 3rd duplicate records
-            linkExistingInternalTransfers(dao)
+            linkExistingInternalTransfersForOwner(dao, owner)
 
             // Clean up orphan auto-created credit cards that have zero linked transactions
-            cleanupOrphanCreditCards(dao)
+            cleanupOrphanCreditCardsForOwner(dao, owner)
         } catch (e: Exception) {
             Log.e(TAG, "Error normalizing existing transactions: ${e.message}", e)
         }
@@ -1621,12 +1801,18 @@ object TransactionIngestionEngine {
      * Detects existing auto-created CardEntity and AccountEntity records with zero linked transactions
      * and marks them as inactive / orphan without deleting user data.
      */
-    suspend fun cleanupOrphanCreditCards(dao: KharchaDao): Int = withContext(Dispatchers.IO) {
+    suspend fun cleanupOrphanCreditCards(dao: KharchaDao): Int {
+        val owner = authenticatedOwner() ?: return 0
+        return cleanupOrphanCreditCardsForOwner(dao, owner)
+    }
+
+    private suspend fun cleanupOrphanCreditCardsForOwner(dao: KharchaDao, owner: String): Int =
+        withContext(Dispatchers.IO) {
         var markedCount = 0
         try {
-            val allTxs = dao.getAllTransactionsSync()
-            val allAccounts = dao.getAllAccountsSync()
-            val allCards = dao.getAllCardsSync()
+            val allTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
+            val allAccounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
+            val allCards = dao.getAllCardsSyncForUser(owner).filter { it.userId == owner }
 
             for (acc in allAccounts) {
                 if (acc.type.equals("Credit Card", ignoreCase = true) && isAutoCreatedCreditCardAccount(acc) && acc.isActive) {
@@ -1681,23 +1867,43 @@ object TransactionIngestionEngine {
         return isDefaultCardPattern || isAutoId
     }
 
-    suspend fun linkExistingInternalTransfers(dao: KharchaDao): Int = withContext(Dispatchers.IO) {
+    suspend fun linkExistingInternalTransfers(dao: KharchaDao): Int {
+        val owner = authenticatedOwner() ?: return 0
+        return linkExistingInternalTransfersForOwner(dao, owner)
+    }
+
+    private suspend fun linkExistingInternalTransfersForOwner(dao: KharchaDao, owner: String): Int =
+        withContext(Dispatchers.IO) {
         var linkedPairs = 0
         try {
             // 1. Ensure cat-transfer category exists in database
             dao.insertCategory(
-                CategoryEntity("cat-transfer", "Internal Transfer", "", "🔄", "#3B82F6", true, true, false, getNowIsoString(), getNowIsoString())
+                CategoryEntity(
+                    id = "cat-transfer",
+                    name = "Internal Transfer",
+                    nameHindi = "",
+                    icon = "🔄",
+                    colour = "#3B82F6",
+                    isDefault = true,
+                    isActive = true,
+                    isIncome = false,
+                    createdAt = getNowIsoString(),
+                    updatedAt = getNowIsoString(),
+                    userId = owner
+                )
             )
 
             // 2. Clean up any cross-source duplicates first
-            cleanupDuplicateTransactions(dao)
+            cleanupDuplicateTransactionsForOwner(dao, owner)
 
-            val accounts = dao.getAllAccountsSync()
+            val accounts = dao.getAllAccountsSyncForUser(owner).filter { it.userId == owner }
             val ownedAccounts = accounts.filter { it.isOwnedByMe }
             val ownedAccountIds = ownedAccounts.map { it.id }.toSet()
             val ownedLast4s = ownedAccounts.map { it.last4Digits.trim() }.filter { it.isNotEmpty() }.toSet()
 
-            val allTxs = dao.getAllTransactionsSync().toMutableList()
+            val allTxs = dao.getAllTransactionsSyncForUser(owner)
+                .filter { it.userId == owner }
+                .toMutableList()
             val processedIds = mutableSetOf<String>()
 
             // 3. Find paired transfers between owned accounts
@@ -1799,7 +2005,9 @@ object TransactionIngestionEngine {
                                 (other.last4Digits.isEmpty() && isDebit)
 
                         if (sameAmount && sameDate && isDebit && isRedundantDuplicate) {
-                            dao.deleteTransaction(other.id)
+                            val duplicateSplits = dao.getSplitsForTransactionSync(owner, other.id)
+                            if (duplicateSplits.isNotEmpty()) continue
+                            dao.deleteTransactionAndSplits(owner, other.id)
                             processedIds.add(other.id)
                             Log.d(TAG, "Removed redundant 3rd transaction for self-transfer: ID=${other.id}, Merchant=${other.merchant}")
                         }
@@ -1883,10 +2091,24 @@ object TransactionIngestionEngine {
         // 1. If manual and user explicitly assigned accountId, keep it strictly
         if (rawTx.source == "MANUAL" && rawTx.accountId.isNotBlank()) {
             val userAcc = accounts.find { it.id == rawTx.accountId }
+            val userCard = rawTx.cardId?.let { cardId ->
+                cards.find { it.id == cardId && it.accountId == rawTx.accountId }
+            }
+            if (rawTx.userId.isBlank() || rawTx.userId == LEGACY_OWNER ||
+                userAcc?.userId != rawTx.userId ||
+                (rawTx.cardId != null && userCard?.userId != rawTx.userId)
+            ) {
+                return MatchedAccountResult(
+                    accountId = "",
+                    cardId = null,
+                    last4Digits = "",
+                    needsReview = true
+                )
+            }
             return MatchedAccountResult(
                 accountId = rawTx.accountId,
-                cardId = rawTx.cardId,
-                last4Digits = rawTx.last4Digits.ifEmpty { userAcc?.last4Digits ?: "" },
+                cardId = userCard?.id,
+                last4Digits = rawTx.last4Digits.ifEmpty { userCard?.last4Digits ?: userAcc?.last4Digits.orEmpty() },
                 needsReview = false
             )
         }
@@ -1896,6 +2118,17 @@ object TransactionIngestionEngine {
             rawText = "$textLower $address ${rawTx.originalReference} ${rawTx.note}",
             source = address
         )
+
+        if (rawTx.source.equals("SMS", ignoreCase = true) && extractedLast4.isNotBlank() &&
+            TransactionIdentityResolver.extractBankName(textLower, address, extractedLast4).isBlank()
+        ) {
+            return MatchedAccountResult(
+                accountId = "",
+                cardId = null,
+                last4Digits = extractedLast4.takeIf { it.length == 4 }.orEmpty(),
+                needsReview = true
+            )
+        }
         
         val resolution = TransactionIdentityResolver.resolveIdentity(evidence, accounts, cards)
         

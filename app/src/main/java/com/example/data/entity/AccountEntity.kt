@@ -1,11 +1,10 @@
 package com.example.data.entity
 
 import androidx.room.Entity
-import androidx.room.PrimaryKey
 
-@Entity(tableName = "accounts")
+@Entity(tableName = "accounts", primaryKeys = ["userId", "id"])
 data class AccountEntity(
-    @PrimaryKey val id: String,
+    val id: String,
     val name: String,
     val type: String, // Bank Account, Credit Card, Debit Card, UPI, Cash
     val bankName: String = "",
@@ -27,5 +26,6 @@ data class AccountEntity(
     val statementDate: String = "",
     val lastBillSource: String = "",
     val lastBillMessageId: String = "",
-    val lastBillUpdatedAt: String = ""
+    val lastBillUpdatedAt: String = "",
+    val userId: String = ""
 )

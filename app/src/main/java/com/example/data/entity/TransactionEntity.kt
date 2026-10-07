@@ -1,11 +1,10 @@
 package com.example.data.entity
 
 import androidx.room.Entity
-import androidx.room.PrimaryKey
 
-@Entity(tableName = "transactions")
+@Entity(tableName = "transactions", primaryKeys = ["userId", "id"])
 data class TransactionEntity(
-    @PrimaryKey val id: String,
+    val id: String,
     val type: String, // "EXPENSE" or "INCOME"
     val amount: Double,
     val date: String, // "YYYY-MM-DD"
@@ -22,7 +21,7 @@ data class TransactionEntity(
     val last4Digits: String = "",
     val createdAt: String = "",
     val updatedAt: String = "",
-    
+
     // New fields for Mapping & Transfers
     val transactionId: String? = null,
     val cardId: String? = null,
@@ -35,5 +34,7 @@ data class TransactionEntity(
     val duplicateFingerprint: String? = null,
     val isInternalTransfer: Boolean = false,
     val needsReview: Boolean = false,
-    val isExpense: Boolean = true
+    val isExpense: Boolean = true,
+    val cardPaymentBalanceApplied: Boolean = false,
+    val userId: String = ""
 )

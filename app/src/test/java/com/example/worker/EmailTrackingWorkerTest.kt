@@ -10,8 +10,10 @@ import com.example.data.database.AppDatabase
 import com.example.data.entity.AccountEntity
 import com.example.data.entity.CardEntity
 import com.example.data.entity.TransactionEntity
+import com.example.utils.CreditCardBillIngestionEngine
 import com.example.utils.EmailParser
 import com.example.utils.EmailParserStatus
+import com.example.utils.TransactionIngestionEngine
 import com.google.android.gms.auth.UserRecoverableAuthException
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -29,8 +31,17 @@ import org.robolectric.annotation.Config
 @Config(sdk = [34])
 class EmailTrackingWorkerTest {
 
+    companion object {
+        private const val TEST_OWNER_UID = "email-test-owner"
+    }
+
     private lateinit var context: Context
     private lateinit var fakeMessageSource: FakeGmailMessageSource
+    private lateinit var previousMessageSource: GmailMessageSource
+    private var previousEmailUidProvider: () -> String? = { null }
+    private var previousSchedulerUidProvider: () -> String? = { null }
+    private var previousTransactionUidProvider: () -> String? = { null }
+    private var previousBillUidProvider: () -> String? = { null }
 
     class FakeGmailMessageSource(
         var tokenResult: Result<String> = Result.success("test_oauth_token"),
@@ -61,15 +72,25 @@ class EmailTrackingWorkerTest {
         WorkManagerTestInitHelper.initializeTestWorkManager(context)
 
         fakeMessageSource = FakeGmailMessageSource()
+        previousMessageSource = EmailSyncEngine.messageSource
         EmailSyncEngine.messageSource = fakeMessageSource
+        previousEmailUidProvider = EmailSyncEngine.liveAuthenticatedUidProvider
+        previousSchedulerUidProvider = EmailTrackingScheduler.liveAuthenticatedUidProvider
+        previousTransactionUidProvider = TransactionIngestionEngine.liveAuthenticatedUidProvider
+        previousBillUidProvider = CreditCardBillIngestionEngine.liveAuthenticatedUidProvider
+        EmailSyncEngine.liveAuthenticatedUidProvider = { TEST_OWNER_UID }
+        EmailTrackingScheduler.liveAuthenticatedUidProvider = { TEST_OWNER_UID }
+        TransactionIngestionEngine.liveAuthenticatedUidProvider = { TEST_OWNER_UID }
+        CreditCardBillIngestionEngine.liveAuthenticatedUidProvider = { TEST_OWNER_UID }
 
         val prefs = context.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
         prefs.edit()
             .putBoolean("email_tracking_enabled", true)
             .putBoolean("gmail_connected", true)
             .putString("gmail_account", "test.user@gmail.com")
+            .putString(EmailTrackingScheduler.PREFS_OWNER_UID, TEST_OWNER_UID)
             .putString("last_email_scan", "Never scanned")
-            .putLong("last_email_scan_checkpoint", 0L)
+            .putLong("last_email_scan_checkpoint_$TEST_OWNER_UID", 0L)
             .commit()
 
         // Clear DB tables
@@ -83,6 +104,11 @@ class EmailTrackingWorkerTest {
 
     @After
     fun tearDown() {
+        EmailSyncEngine.messageSource = previousMessageSource
+        EmailSyncEngine.liveAuthenticatedUidProvider = previousEmailUidProvider
+        EmailTrackingScheduler.liveAuthenticatedUidProvider = previousSchedulerUidProvider
+        TransactionIngestionEngine.liveAuthenticatedUidProvider = previousTransactionUidProvider
+        CreditCardBillIngestionEngine.liveAuthenticatedUidProvider = previousBillUidProvider
         val prefs = context.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
         prefs.edit().clear().commit()
     }
@@ -242,7 +268,8 @@ class EmailTrackingWorkerTest {
             originalReference = "SMS-101",
             last4Digits = "1234",
             createdAt = "2026-09-27T10:30:00Z",
-            updatedAt = "2026-09-27T10:30:00Z"
+            updatedAt = "2026-09-27T10:30:00Z",
+            userId = TEST_OWNER_UID
         )
         dao.insertTransaction(smsTx)
         assertEquals(1, dao.getAllTransactionsSync().size)
@@ -316,7 +343,8 @@ class EmailTrackingWorkerTest {
             name = "User Bank Account",
             type = "Bank Account",
             last4Digits = "9999",
-            bankName = "User Bank"
+            bankName = "User Bank",
+            userId = TEST_OWNER_UID
         )
         dao.insertAccount(account)
 
@@ -446,7 +474,9 @@ class EmailTrackingWorkerTest {
         val status = prefs.getString("last_email_scan", "")
         assertEquals("Waiting for network", status)
 
-        val worker = androidx.work.testing.TestListenableWorkerBuilder<EmailTrackingWorker>(context).build()
+        val worker = androidx.work.testing.TestListenableWorkerBuilder<EmailTrackingWorker>(context)
+            .setInputData(androidx.work.workDataOf(EmailTrackingScheduler.INPUT_OWNER_UID to TEST_OWNER_UID))
+            .build()
         val workerResult = worker.doWork()
         assertEquals(androidx.work.ListenableWorker.Result.retry(), workerResult)
     }
@@ -466,7 +496,9 @@ class EmailTrackingWorkerTest {
         assertEquals("Authorization required", status)
 
         // In worker, this maps to Result.success() without crashing or opening an Activity
-        val worker = androidx.work.testing.TestListenableWorkerBuilder<EmailTrackingWorker>(context).build()
+        val worker = androidx.work.testing.TestListenableWorkerBuilder<EmailTrackingWorker>(context)
+            .setInputData(androidx.work.workDataOf(EmailTrackingScheduler.INPUT_OWNER_UID to TEST_OWNER_UID))
+            .build()
         val workerResult = worker.doWork()
         assertEquals(androidx.work.ListenableWorker.Result.success(), workerResult)
     }
@@ -509,7 +541,7 @@ class EmailTrackingWorkerTest {
 
         // Verify checkpoint advanced to the newest message date (page2-30 timestamp)
         val prefs = context.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
-        val checkpoint = prefs.getLong("last_email_scan_checkpoint", 0L)
+        val checkpoint = prefs.getLong("last_email_scan_checkpoint_$TEST_OWNER_UID", 0L)
         val expectedMaxDate = 1700000000000L + (30 * 1000L)
         assertEquals(expectedMaxDate, checkpoint)
     }
@@ -519,7 +551,7 @@ class EmailTrackingWorkerTest {
         // Initial checkpoint
         val initialCheckpoint = 1700000000000L
         val prefs = context.getSharedPreferences("kharcha_prefs", Context.MODE_PRIVATE)
-        prefs.edit().putLong("last_email_scan_checkpoint", initialCheckpoint).commit()
+        prefs.edit().putLong("last_email_scan_checkpoint_$TEST_OWNER_UID", initialCheckpoint).commit()
 
         val page1Messages = (1..25).map { idx ->
             GmailMessageData(
@@ -555,7 +587,7 @@ class EmailTrackingWorkerTest {
         assertEquals(25, dao.getAllTransactionsSync().size)
 
         // Checkpoint must NOT advance because unfetched pages remain
-        val checkpointAfterRun1 = prefs.getLong("last_email_scan_checkpoint", 0L)
+        val checkpointAfterRun1 = prefs.getLong("last_email_scan_checkpoint_$TEST_OWNER_UID", 0L)
         assertEquals("Checkpoint must not advance past unprocessed pages", initialCheckpoint, checkpointAfterRun1)
 
         // Run 2: All remaining pages are now fully retrieved through the end (nextPageToken = null)
@@ -574,7 +606,7 @@ class EmailTrackingWorkerTest {
         assertEquals(30, dao.getAllTransactionsSync().size)
 
         // Now that all pages were completely processed, checkpoint advances to latest
-        val checkpointAfterRun2 = prefs.getLong("last_email_scan_checkpoint", 0L)
+        val checkpointAfterRun2 = prefs.getLong("last_email_scan_checkpoint_$TEST_OWNER_UID", 0L)
         val expectedFinalDate = initialCheckpoint + (30 * 1000L)
         assertEquals(expectedFinalDate, checkpointAfterRun2)
     }
@@ -590,7 +622,8 @@ class EmailTrackingWorkerTest {
             last4Digits = "6926",
             creditLimit = 100000.0,
             outstandingAmount = 0.0,
-            dueDate = 0
+            dueDate = 0,
+            userId = TEST_OWNER_UID
         )
         val account = AccountEntity(
             id = "acc-yes-6926",
@@ -601,7 +634,8 @@ class EmailTrackingWorkerTest {
             colour = "#1E293B",
             creditLimit = 100000.0,
             outstandingAmount = 0.0,
-            dueDate = 0
+            dueDate = 0,
+            userId = TEST_OWNER_UID
         )
         dao.insertAccount(account)
         dao.insertCard(card)
@@ -630,8 +664,8 @@ class EmailTrackingWorkerTest {
     @Test
     fun testTestB_YesBankActualTransactionPreserved() = runBlocking {
         val dao = AppDatabase.getDatabase(context).kharchaDao()
-        val card = CardEntity(id = "card-yes-6926", accountId = "acc-yes-6926", name = "YES BANK Credit Card", type = "Credit Card", last4Digits = "6926", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
-        val account = AccountEntity(id = "acc-yes-6926", name = "YES BANK Credit Card", bankName = "YES Bank", type = "Credit Card", last4Digits = "6926", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
+        val card = CardEntity(id = "card-yes-6926", accountId = "acc-yes-6926", name = "YES BANK Credit Card", type = "Credit Card", last4Digits = "6926", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
+        val account = AccountEntity(id = "acc-yes-6926", name = "YES BANK Credit Card", bankName = "YES Bank", type = "Credit Card", last4Digits = "6926", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
         dao.insertAccount(account)
         dao.insertCard(card)
 
@@ -658,8 +692,8 @@ class EmailTrackingWorkerTest {
     @Test
     fun testTestC_SbiActualTransactionPreserved() = runBlocking {
         val dao = AppDatabase.getDatabase(context).kharchaDao()
-        val card = CardEntity(id = "card-sbi-2663", accountId = "acc-sbi-2663", name = "SBI Credit Card", type = "Credit Card", last4Digits = "2663", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
-        val account = AccountEntity(id = "acc-sbi-2663", name = "SBI Credit Card", bankName = "SBI", type = "Credit Card", last4Digits = "2663", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
+        val card = CardEntity(id = "card-sbi-2663", accountId = "acc-sbi-2663", name = "SBI Credit Card", type = "Credit Card", last4Digits = "2663", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
+        val account = AccountEntity(id = "acc-sbi-2663", name = "SBI Credit Card", bankName = "SBI", type = "Credit Card", last4Digits = "2663", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
         dao.insertAccount(account)
         dao.insertCard(card)
 
@@ -685,8 +719,8 @@ class EmailTrackingWorkerTest {
     @Test
     fun testTestD_IciciActualTransactionPreserved() = runBlocking {
         val dao = AppDatabase.getDatabase(context).kharchaDao()
-        val card = CardEntity(id = "card-icici-7008", accountId = "acc-icici-7008", name = "ICICI Bank Credit Card", type = "Credit Card", last4Digits = "7008", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
-        val account = AccountEntity(id = "acc-icici-7008", name = "ICICI Bank Credit Card", bankName = "ICICI Bank", type = "Credit Card", last4Digits = "7008", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0)
+        val card = CardEntity(id = "card-icici-7008", accountId = "acc-icici-7008", name = "ICICI Bank Credit Card", type = "Credit Card", last4Digits = "7008", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
+        val account = AccountEntity(id = "acc-icici-7008", name = "ICICI Bank Credit Card", bankName = "ICICI Bank", type = "Credit Card", last4Digits = "7008", colour = "#1E293B", creditLimit = 50000.0, outstandingAmount = 0.0, dueDate = 0, userId = TEST_OWNER_UID)
         dao.insertAccount(account)
         dao.insertCard(card)
 

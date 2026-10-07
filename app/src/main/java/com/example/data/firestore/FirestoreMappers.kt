@@ -23,6 +23,27 @@ fun sanitizeFirestoreText(text: String?): String {
     return text.trim()
 }
 
+private fun Map<String, Any?>.ownerFor(expectedUserId: String?): String {
+    if (expectedUserId == null) return (this["userId"] as? String).orEmpty()
+
+    if (containsKey("userId")) {
+        val payloadUserId = this["userId"] as? String
+        require(!payloadUserId.isNullOrBlank() && payloadUserId == expectedUserId) {
+            "Firestore record userId does not match its authenticated owner"
+        }
+    }
+    return expectedUserId
+}
+
+private fun requireFirestoreOwner(entityUserId: String, expectedUserId: String) {
+    require(expectedUserId.isNotBlank() && expectedUserId != "legacy:unassigned") {
+        "Firestore writes require an authenticated user owner"
+    }
+    require(entityUserId == expectedUserId && entityUserId != "legacy:unassigned") {
+        "Firestore entity owner does not match its destination"
+    }
+}
+
 /**
  * UserEntity <-> Firestore Map
  */
@@ -53,9 +74,11 @@ fun Map<String, Any?>.toUserEntity(fallbackId: String): UserEntity {
 /**
  * AccountEntity <-> Firestore Map
  */
-fun AccountEntity.toFirestoreMap(): Map<String, Any?> {
+fun AccountEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "name" to sanitizeFirestoreText(name),
         "type" to type,
         "bankName" to sanitizeFirestoreText(bankName),
@@ -81,7 +104,7 @@ fun AccountEntity.toFirestoreMap(): Map<String, Any?> {
     )
 }
 
-fun Map<String, Any?>.toAccountEntity(fallbackId: String): AccountEntity {
+fun Map<String, Any?>.toAccountEntity(fallbackId: String, expectedUserId: String? = null): AccountEntity {
     return AccountEntity(
         id = (get("id") as? String) ?: fallbackId,
         name = (get("name") as? String) ?: "",
@@ -105,16 +128,19 @@ fun Map<String, Any?>.toAccountEntity(fallbackId: String): AccountEntity {
         statementDate = (get("statementDate") as? String) ?: "",
         lastBillSource = (get("lastBillSource") as? String) ?: "",
         lastBillMessageId = (get("lastBillMessageId") as? String) ?: "",
-        lastBillUpdatedAt = (get("lastBillUpdatedAt") as? String) ?: ""
+        lastBillUpdatedAt = (get("lastBillUpdatedAt") as? String) ?: "",
+        userId = ownerFor(expectedUserId)
     )
 }
 
 /**
  * CardEntity <-> Firestore Map
  */
-fun CardEntity.toFirestoreMap(): Map<String, Any?> {
+fun CardEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "accountId" to accountId,
         "name" to sanitizeFirestoreText(name),
         "type" to type,
@@ -134,7 +160,7 @@ fun CardEntity.toFirestoreMap(): Map<String, Any?> {
     )
 }
 
-fun Map<String, Any?>.toCardEntity(fallbackId: String): CardEntity {
+fun Map<String, Any?>.toCardEntity(fallbackId: String, expectedUserId: String? = null): CardEntity {
     return CardEntity(
         id = (get("id") as? String) ?: fallbackId,
         accountId = (get("accountId") as? String) ?: "",
@@ -152,16 +178,19 @@ fun Map<String, Any?>.toCardEntity(fallbackId: String): CardEntity {
         statementDate = (get("statementDate") as? String) ?: "",
         lastBillSource = (get("lastBillSource") as? String) ?: "",
         lastBillMessageId = (get("lastBillMessageId") as? String) ?: "",
-        lastBillUpdatedAt = (get("lastBillUpdatedAt") as? String) ?: ""
+        lastBillUpdatedAt = (get("lastBillUpdatedAt") as? String) ?: "",
+        userId = ownerFor(expectedUserId)
     )
 }
 
 /**
  * TransactionEntity <-> Firestore Map
  */
-fun TransactionEntity.toFirestoreMap(): Map<String, Any?> {
+fun TransactionEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "type" to type,
         "amount" to amount,
         "date" to date,
@@ -189,11 +218,12 @@ fun TransactionEntity.toFirestoreMap(): Map<String, Any?> {
         "duplicateFingerprint" to duplicateFingerprint,
         "isInternalTransfer" to isInternalTransfer,
         "needsReview" to needsReview,
-        "isExpense" to isExpense
+        "isExpense" to isExpense,
+        "cardPaymentBalanceApplied" to cardPaymentBalanceApplied
     )
 }
 
-fun Map<String, Any?>.toTransactionEntity(fallbackId: String): TransactionEntity {
+fun Map<String, Any?>.toTransactionEntity(fallbackId: String, expectedUserId: String? = null): TransactionEntity {
     return TransactionEntity(
         id = (get("id") as? String) ?: fallbackId,
         type = (get("type") as? String) ?: "EXPENSE",
@@ -223,16 +253,20 @@ fun Map<String, Any?>.toTransactionEntity(fallbackId: String): TransactionEntity
         duplicateFingerprint = get("duplicateFingerprint") as? String,
         isInternalTransfer = (get("isInternalTransfer") as? Boolean) ?: false,
         needsReview = (get("needsReview") as? Boolean) ?: false,
-        isExpense = (get("isExpense") as? Boolean) ?: true
+        isExpense = (get("isExpense") as? Boolean) ?: true,
+        cardPaymentBalanceApplied = (get("cardPaymentBalanceApplied") as? Boolean) ?: false,
+        userId = ownerFor(expectedUserId)
     )
 }
 
 /**
  * CategoryEntity <-> Firestore Map
  */
-fun CategoryEntity.toFirestoreMap(): Map<String, Any?> {
+fun CategoryEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "name" to sanitizeFirestoreText(name),
         "nameHindi" to sanitizeFirestoreText(nameHindi),
         "icon" to icon,
@@ -245,7 +279,7 @@ fun CategoryEntity.toFirestoreMap(): Map<String, Any?> {
     )
 }
 
-fun Map<String, Any?>.toCategoryEntity(fallbackId: String): CategoryEntity {
+fun Map<String, Any?>.toCategoryEntity(fallbackId: String, expectedUserId: String? = null): CategoryEntity {
     return CategoryEntity(
         id = (get("id") as? String) ?: fallbackId,
         name = (get("name") as? String) ?: "",
@@ -256,16 +290,19 @@ fun Map<String, Any?>.toCategoryEntity(fallbackId: String): CategoryEntity {
         isActive = (get("isActive") as? Boolean) ?: true,
         isIncome = (get("isIncome") as? Boolean) ?: false,
         createdAt = (get("createdAt") as? String) ?: "",
-        updatedAt = (get("updatedAt") as? String) ?: ""
+        updatedAt = (get("updatedAt") as? String) ?: "",
+        userId = ownerFor(expectedUserId)
     )
 }
 
 /**
  * SubcategoryEntity <-> Firestore Map
  */
-fun SubcategoryEntity.toFirestoreMap(): Map<String, Any?> {
+fun SubcategoryEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "categoryId" to categoryId,
         "name" to sanitizeFirestoreText(name),
         "nameHindi" to sanitizeFirestoreText(nameHindi),
@@ -278,7 +315,7 @@ fun SubcategoryEntity.toFirestoreMap(): Map<String, Any?> {
     )
 }
 
-fun Map<String, Any?>.toSubcategoryEntity(fallbackId: String): SubcategoryEntity {
+fun Map<String, Any?>.toSubcategoryEntity(fallbackId: String, expectedUserId: String? = null): SubcategoryEntity {
     return SubcategoryEntity(
         id = (get("id") as? String) ?: fallbackId,
         categoryId = (get("categoryId") as? String) ?: "",
@@ -289,16 +326,19 @@ fun Map<String, Any?>.toSubcategoryEntity(fallbackId: String): SubcategoryEntity
         isDefault = (get("isDefault") as? Boolean) ?: false,
         isActive = (get("isActive") as? Boolean) ?: true,
         createdAt = (get("createdAt") as? String) ?: "",
-        updatedAt = (get("updatedAt") as? String) ?: ""
+        updatedAt = (get("updatedAt") as? String) ?: "",
+        userId = ownerFor(expectedUserId)
     )
 }
 
 /**
  * TransactionSplitEntity <-> Firestore Map
  */
-fun TransactionSplitEntity.toFirestoreMap(): Map<String, Any?> {
+fun TransactionSplitEntity.toFirestoreMap(expectedUserId: String): Map<String, Any?> {
+    requireFirestoreOwner(userId, expectedUserId)
     return mapOf(
         "id" to id,
+        "userId" to userId,
         "transactionId" to transactionId,
         "categoryId" to categoryId,
         "subcategoryId" to subcategoryId,
@@ -309,7 +349,10 @@ fun TransactionSplitEntity.toFirestoreMap(): Map<String, Any?> {
     )
 }
 
-fun Map<String, Any?>.toTransactionSplitEntity(fallbackId: String): TransactionSplitEntity {
+fun Map<String, Any?>.toTransactionSplitEntity(
+    fallbackId: String,
+    expectedUserId: String? = null
+): TransactionSplitEntity {
     return TransactionSplitEntity(
         id = (get("id") as? String) ?: fallbackId,
         transactionId = (get("transactionId") as? String) ?: "",
@@ -318,6 +361,7 @@ fun Map<String, Any?>.toTransactionSplitEntity(fallbackId: String): TransactionS
         amount = ((get("amount") as? Number)?.toDouble()) ?: 0.0,
         note = (get("note") as? String) ?: "",
         createdAt = (get("createdAt") as? String) ?: "",
-        updatedAt = (get("updatedAt") as? String) ?: ""
+        updatedAt = (get("updatedAt") as? String) ?: "",
+        userId = ownerFor(expectedUserId)
     )
 }

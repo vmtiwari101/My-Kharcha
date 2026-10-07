@@ -29,10 +29,15 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
         const val EXTRA_DUE_DATE = "extra_due_date"
         const val EXTRA_OFFSET_DAYS = "extra_offset_days"
         const val EXTRA_ACCOUNT_ID = "extra_account_id"
+        const val EXTRA_OWNER_UID = "extra_owner_uid"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
+        val liveUid = CreditCardReminderManager.liveAuthenticatedUid() ?: run {
+            Log.w(TAG, "Reminder broadcast ignored because no live authenticated user is available")
+            return
+        }
         Log.d(TAG, "Received broadcast action: $action")
 
         when (action) {
@@ -49,6 +54,11 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
                 val dueDate = intent.getIntExtra(EXTRA_DUE_DATE, 0)
                 val offsetDays = intent.getIntExtra(EXTRA_OFFSET_DAYS, 0)
                 val accountId = intent.getStringExtra(EXTRA_ACCOUNT_ID) ?: ""
+                val scheduledOwnerUid = intent.getStringExtra(EXTRA_OWNER_UID)
+                if (!CreditCardReminderManager.isScheduledOwnerValid(liveUid, scheduledOwnerUid)) {
+                    Log.w(TAG, "Reminder alarm ignored because its owner does not match the live user")
+                    return
+                }
 
                 handleReminderTrigger(
                     context = context,
@@ -57,7 +67,8 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
                     last4 = last4,
                     dueDate = dueDate,
                     offsetDays = offsetDays,
-                    accountId = accountId
+                    accountId = accountId,
+                    scheduledOwnerUid = scheduledOwnerUid
                 )
             }
         }
@@ -70,29 +81,62 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
         last4: String,
         dueDate: Int,
         offsetDays: Int,
-        accountId: String
+        accountId: String,
+        scheduledOwnerUid: String?
     ) {
+        val ownerUid = CreditCardReminderManager.liveAuthenticatedUid() ?: return
+        if (!CreditCardReminderManager.isScheduledOwnerValid(ownerUid, scheduledOwnerUid)) return
         val appContext = context.applicationContext
         val pendingResult = goAsync()
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                if (!CreditCardReminderManager.isScheduledOwnerValid(
+                        CreditCardReminderManager.liveAuthenticatedUid(),
+                        ownerUid
+                    )
+                ) return@launch
+
                 // Verify user hasn't disabled reminders for this card
-                if (!CreditCardReminderManager.isReminderEnabledForCard(appContext, cardKey)) {
+                if (!CreditCardReminderManager.isReminderEnabledForOwner(appContext, ownerUid, cardKey)) {
                     Log.d(TAG, "Reminders disabled for $bankName ($last4), skipping notification")
                     return@launch
                 }
+                if (!CreditCardReminderManager.isScheduledOwnerValid(
+                        CreditCardReminderManager.liveAuthenticatedUid(),
+                        ownerUid
+                    )
+                ) return@launch
 
                 val db = AppDatabase.getDatabase(appContext)
                 val dao = db.kharchaDao()
 
-                val accounts = dao.getAllAccountsSync()
-                val cards = dao.getAllCardsSync()
-                val transactions = dao.getAllTransactionsSync()
+                val accounts = dao.getAllAccountsSyncForUser(ownerUid).filter { it.userId == ownerUid }
+                val cards = dao.getAllCardsSyncForUser(ownerUid).filter { it.userId == ownerUid }
+                val transactions = dao.getAllTransactionsSyncForUser(ownerUid).filter { it.userId == ownerUid }
 
                 val matchedAcc = accounts.find { it.id == accountId }
-                    ?: accounts.find { it.last4Digits == last4 && it.type.equals("Credit Card", ignoreCase = true) }
-                val matchedCard = cards.find { it.last4Digits == last4 && (matchedAcc == null || it.accountId == matchedAcc.id) }
+                    ?: accounts.find {
+                        it.last4Digits == last4 && it.type.equals("Credit Card", ignoreCase = true)
+                    }
+                val matchedCard = cards.find {
+                    it.last4Digits == last4 && (matchedAcc == null || it.accountId == matchedAcc.id)
+                }
+                if (matchedAcc == null && matchedCard == null) {
+                    Log.w(TAG, "Reminder alarm ignored because no owner-matched account/card exists")
+                    return@launch
+                }
+
+                val ownerBankName = matchedAcc?.bankName?.ifEmpty { matchedAcc.name } ?: matchedCard?.name.orEmpty()
+                val ownerLast4 = matchedCard?.last4Digits?.ifEmpty { matchedAcc?.last4Digits.orEmpty() }
+                    ?: matchedAcc?.last4Digits.orEmpty()
+                if (CreditCardReminderManager.getCardKey(bankName, last4) != cardKey ||
+                    ownerLast4 != last4 ||
+                    !com.example.utils.TransactionIngestionEngine.isBankNameMatch(ownerBankName, bankName)
+                ) {
+                    Log.w(TAG, "Reminder alarm ignored because its card identity does not match owner data")
+                    return@launch
+                }
 
                 // Calculate current live outstanding balance directly from centralized transactions
                 val linkedTxs = transactions.filter { tx ->
@@ -103,7 +147,14 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
                 }
 
                 val expenseTotal = linkedTxs.filter { (it.direction == "DEBIT" || it.type == "EXPENSE") && !it.isInternalTransfer && it.transactionType != "CARD_PAYMENT" }.sumOf { it.amount }
-                val paymentTotal = linkedTxs.filter { it.transactionType == "CARD_PAYMENT" || (it.direction == "CREDIT" && !it.isInternalTransfer) }.sumOf { it.amount }
+                val paymentTotal = linkedTxs.filter {
+                    com.example.utils.TransactionIdentityResolver.isCreditCardPaymentOrRefund(
+                        it,
+                        cardId = matchedCard?.id,
+                        accountId = matchedAcc?.id ?: matchedCard?.accountId.orEmpty(),
+                        last4 = last4
+                    )
+                }.sumOf { it.amount }
                 val txOutstanding = (expenseTotal - paymentTotal).coerceAtLeast(0.0)
                 val storedOutstanding = maxOf(matchedAcc?.outstandingAmount ?: 0.0, matchedCard?.outstandingAmount ?: 0.0)
                 val effectiveOutstanding = if (txOutstanding > 0.0) txOutstanding else storedOutstanding
@@ -125,20 +176,26 @@ class CreditCardReminderReceiver : BroadcastReceiver() {
                 }
 
                 val title = if (offsetDays == 0) {
-                    "Payment Due Today: $bankName •••• $last4"
+                    "Payment Due Today: $ownerBankName •••• $ownerLast4"
                 } else {
-                    "Upcoming Due: $bankName •••• $last4"
+                    "Upcoming Due: $ownerBankName •••• $ownerLast4"
                 }
 
                 val content = "Outstanding amount of ${formatINR(effectiveOutstanding)} is due $offsetText (${dueDate}th of this month)."
 
-                showNotification(appContext, cardKey, dueDate, offsetDays, title, content)
+                if (!CreditCardReminderManager.isScheduledOwnerValid(
+                        CreditCardReminderManager.liveAuthenticatedUid(),
+                        ownerUid
+                    )
+                ) return@launch
+                showNotification(appContext, "$ownerUid:$cardKey", dueDate, offsetDays, title, content)
 
                 // Reschedule for next month's cycle
-                CreditCardReminderManager.scheduleRemindersForCard(
+                CreditCardReminderManager.scheduleRemindersForOwner(
                     context = appContext,
-                    bankName = bankName,
-                    last4 = last4,
+                    owner = ownerUid,
+                    bankName = ownerBankName,
+                    last4 = ownerLast4,
                     dueDate = dueDate,
                     accountId = accountId,
                     outstandingAmount = effectiveOutstanding

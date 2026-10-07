@@ -6,7 +6,6 @@ import android.content.SharedPreferences
 import android.util.Log
 import com.example.data.database.AppDatabase
 import com.example.data.repository.KharchaRepository
-import com.example.utils.AuthManager
 import com.example.utils.KharchaBackupManager
 import com.example.utils.BillIngestionResult
 import com.example.utils.CreditCardBillIngestionEngine
@@ -14,6 +13,7 @@ import com.example.utils.EmailParser
 import com.example.utils.EmailParserStatus
 import com.example.utils.IngestionStatus
 import com.example.utils.TransactionIngestionEngine
+import com.google.firebase.auth.FirebaseAuth
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.UserRecoverableAuthException
 import com.google.api.client.googleapis.auth.oauth2.GoogleCredential
@@ -153,20 +153,55 @@ object EmailSyncEngine {
     private const val PREFS_NAME = "kharcha_prefs"
     const val MAX_PAGES_PER_RUN = 4
     const val PAGE_SIZE = 25L
+    private const val LEGACY_OWNER = "legacy:unassigned"
 
     // Swappable for tests
     var messageSource: GmailMessageSource = DefaultGmailMessageSource()
+
+    @Volatile
+    internal var liveAuthenticatedUidProvider: () -> String? = {
+        try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase authentication is unavailable", e)
+            null
+        }
+    }
+
+    internal fun liveAuthenticatedUid(): String? =
+        liveAuthenticatedUidProvider()?.takeIf { it.isNotBlank() && it != LEGACY_OWNER }
+
+    private fun isCurrentOwner(owner: String): Boolean = liveAuthenticatedUid() == owner
 
     private fun getPrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    fun updateScanStatus(context: Context, status: String) {
+    private fun updateScanStatus(context: Context, status: String) {
         getPrefs(context).edit().putString("last_email_scan", status).apply()
     }
 
-    suspend fun syncEmails(context: Context, isBackground: Boolean = true): SyncResult = withContext(Dispatchers.IO) {
+    private fun updateScanStatusForOwner(context: Context, owner: String, status: String) {
+        if (isCurrentOwner(owner)) updateScanStatus(context, status)
+    }
+
+    suspend fun syncEmails(
+        context: Context,
+        isBackground: Boolean = true,
+        expectedOwnerUid: String? = null
+    ): SyncResult = withContext(Dispatchers.IO) {
+        val owner = liveAuthenticatedUid()
+            ?: return@withContext SyncResult.Skipped("No authenticated Firebase user")
+        if (expectedOwnerUid != null && expectedOwnerUid != owner) {
+            Log.w(TAG, "Email sync rejected because scheduled owner does not match live Firebase user")
+            return@withContext SyncResult.Skipped("Authenticated user changed")
+        }
+
         val prefs = getPrefs(context)
+        if (prefs.getString(EmailTrackingScheduler.PREFS_OWNER_UID, null) != owner) {
+            Log.w(TAG, "Email sync skipped because Gmail settings belong to another or unknown Firebase user")
+            return@withContext SyncResult.Skipped("Gmail account is not bound to the authenticated user")
+        }
         val isEnabled = prefs.getBoolean("email_tracking_enabled", false)
         if (!isEnabled) {
             Log.d(TAG, "Email tracking disabled in preferences. Skipping sync.")
@@ -188,21 +223,22 @@ object EmailSyncEngine {
             val ex = tokenResult.exceptionOrNull()
             Log.e(TAG, "Failed to get authorization token: ${ex?.message}")
             if (ex is UserRecoverableAuthException || ex?.message?.contains("User intervention required", true) == true) {
-                updateScanStatus(context, "Authorization required")
+                updateScanStatusForOwner(context, owner, "Authorization required")
                 return@withContext SyncResult.AuthRequired
             }
             if (ex is IOException || ex?.message?.contains("network", true) == true) {
-                updateScanStatus(context, "Waiting for network")
+                updateScanStatusForOwner(context, owner, "Waiting for network")
                 return@withContext SyncResult.NetworkError(ex.message ?: "Network error")
             }
-            updateScanStatus(context, "Authorization required")
+            updateScanStatusForOwner(context, owner, "Authorization required")
             return@withContext SyncResult.AuthRequired
         }
 
         val token = tokenResult.getOrThrow()
 
         // 2. Determine incremental query
-        val lastCheckpoint = prefs.getLong("last_email_scan_checkpoint", 0L)
+        val checkpointKey = "last_email_scan_checkpoint_$owner"
+        val lastCheckpoint = prefs.getLong(checkpointKey, 0L)
         val query = if (lastCheckpoint > 0L) {
             // 5 minute safety overlap window (300 seconds)
             val afterSec = maxOf(0L, (lastCheckpoint / 1000L) - 300L)
@@ -212,8 +248,14 @@ object EmailSyncEngine {
         }
 
         // 3. Ingest messages using central engines with safe pagination
+        if (!isCurrentOwner(owner)) {
+            return@withContext SyncResult.Skipped("Authenticated user changed")
+        }
         val dao = AppDatabase.getDatabase(context).kharchaDao()
-        val existingTxs = dao.getAllTransactionsSync()
+        if (!isCurrentOwner(owner)) {
+            return@withContext SyncResult.Skipped("Authenticated user changed")
+        }
+        val existingTxs = dao.getAllTransactionsSyncForUser(owner).filter { it.userId == owner }
         val processedRefs = existingTxs.mapNotNull { it.originalReference }.toMutableSet()
 
         var imported = 0
@@ -232,7 +274,7 @@ object EmailSyncEngine {
                 messageSource.fetchMessagesPage(token, query, maxResults = PAGE_SIZE, pageToken = currentPageToken)
             } catch (e: IOException) {
                 Log.w(TAG, "Network failure while fetching messages: ${e.message}")
-                updateScanStatus(context, "Waiting for network")
+                updateScanStatusForOwner(context, owner, "Waiting for network")
                 return@withContext SyncResult.NetworkError(e.message ?: "Network error")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed fetching messages: ${e.message}", e)
@@ -243,6 +285,10 @@ object EmailSyncEngine {
             totalMessagesFetched += messages.size
 
             for (msg in messages) {
+                if (!isCurrentOwner(owner)) {
+                    Log.w(TAG, "Email sync stopped because the authenticated user changed")
+                    return@withContext SyncResult.Skipped("Authenticated user changed")
+                }
                 if (msg.internalDate > maxInternalDateInRun) {
                     maxInternalDateInRun = msg.internalDate
                 }
@@ -265,7 +311,16 @@ object EmailSyncEngine {
                         msg.internalDate
                     )
                     if (billInfo != null) {
-                        val billResult = CreditCardBillIngestionEngine.ingestBillInfo(context, billInfo)
+                        if (liveAuthenticatedUid() != owner) {
+                            Log.w(TAG, "Email bill skipped because the authenticated user changed")
+                            ignored++
+                            continue
+                        }
+                        val billResult = CreditCardBillIngestionEngine.ingestBillInfo(
+                            context,
+                            billInfo,
+                            expectedOwnerUid = owner
+                        )
                         when (billResult) {
                             is BillIngestionResult.Updated,
                             is BillIngestionResult.UnlinkedReminder -> {
@@ -282,18 +337,30 @@ object EmailSyncEngine {
                 }
 
                 // Standard transaction parsing via existing EmailParser
+                if (!isCurrentOwner(owner)) {
+                    return@withContext SyncResult.Skipped("Authenticated user changed")
+                }
+                val ownerTransactions = dao.getAllTransactionsSyncForUser(owner)
+                    .filter { it.userId == owner }
+                if (!isCurrentOwner(owner)) {
+                    return@withContext SyncResult.Skipped("Authenticated user changed")
+                }
                 val parseResult = EmailParser.parseEmail(
                     messageId = msg.id,
                     subject = msg.subject,
                     body = msg.snippet,
                     timestamp = msg.internalDate,
-                    existingTransactions = dao.getAllTransactionsSync()
+                    existingTransactions = ownerTransactions
                 )
 
                 if (parseResult.transaction != null) {
+                    if (!isCurrentOwner(owner)) {
+                        return@withContext SyncResult.Skipped("Authenticated user changed")
+                    }
+                    val emailTransaction = parseResult.transaction.copy(userId = owner)
                     val ingestionResult = TransactionIngestionEngine.ingestTransaction(
                         context,
-                        parseResult.transaction,
+                        emailTransaction,
                         fullEmailText
                     )
                     when (ingestionResult.second) {
@@ -332,13 +399,13 @@ object EmailSyncEngine {
             } else {
                 "Last scanned: $nowFmt (0 imported)"
             }
-            updateScanStatus(context, status)
+            updateScanStatusForOwner(context, owner, status)
             return@withContext SyncResult.Success(imported = 0, duplicates = 0, ignored = 0)
         }
 
         // 4. Update incremental checkpoint ONLY if all pages in the window were completely retrieved
-        if (!hasMoreUnfetchedPages && maxInternalDateInRun > lastCheckpoint) {
-            prefs.edit().putLong("last_email_scan_checkpoint", maxInternalDateInRun).apply()
+        if (!hasMoreUnfetchedPages && maxInternalDateInRun > lastCheckpoint && isCurrentOwner(owner)) {
+            prefs.edit().putLong(checkpointKey, maxInternalDateInRun).apply()
         }
 
         // 5. Update user-visible status
@@ -351,11 +418,10 @@ object EmailSyncEngine {
         } else {
             "Last scanned: $nowFmt ($imported imported)"
         }
-        updateScanStatus(context, statusText)
+        updateScanStatusForOwner(context, owner, statusText)
 
         // 6. Mark backup pending for Google Drive if new transactions were imported
-        val user = AuthManager.currentUser.value
-        if (user != null && imported > 0) {
+        if (isCurrentOwner(owner) && imported > 0) {
             try {
                 KharchaBackupManager.markBackupPending(context)
             } catch (e: Exception) {
