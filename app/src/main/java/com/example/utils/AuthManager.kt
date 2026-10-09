@@ -12,7 +12,6 @@ import androidx.credentials.GetCredentialResponse
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import com.example.data.entity.UserEntity
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.firebase.auth.FirebaseAuth
@@ -205,22 +204,12 @@ object AuthManager {
         val digest = md.digest(bytes)
         val hashedNonce = digest.fold("") { str, it -> str + "%02x".format(it) }
 
-        // Option 1: GetSignInWithGoogleOption for explicit button clicks; enables account chooser across all device accounts
         val signInWithGoogleOption = GetSignInWithGoogleOption.Builder(serverClientId)
-            .setNonce(hashedNonce)
-            .build()
-
-        // Option 2: GetGoogleIdOption configured to allow unauthorized accounts on first login
-        val googleIdOption = GetGoogleIdOption.Builder()
-            .setFilterByAuthorizedAccounts(false)
-            .setServerClientId(serverClientId)
-            .setAutoSelectEnabled(false)
             .setNonce(hashedNonce)
             .build()
 
         val request = GetCredentialRequest.Builder()
             .addCredentialOption(signInWithGoogleOption)
-            .addCredentialOption(googleIdOption)
             .build()
 
         val result: GetCredentialResponse = try {
